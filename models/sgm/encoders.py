@@ -188,6 +188,7 @@ class GeneralConditioner(nn.Module):
             embedding_context = nullcontext if embedder.is_trainable else torch.no_grad
             with embedding_context():
                 if hasattr(embedder, "input_key") and (embedder.input_key is not None):
+                    # print("input_key",batch[embedder.input_key])
                     emb_out = embedder(batch[embedder.input_key])
                 elif hasattr(embedder, "input_keys"):
                     emb_out = embedder(*[batch[k] for k in embedder.input_keys])
@@ -452,6 +453,7 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
         batch_size = input_ids.size()[0]
         
         input_ids = input_ids.reshape((-1, self.clip_tokenizer.model_max_length))
+        # print("input_ids",input_ids.shape)
         z = self.encode_with_transformer(input_ids)
         if not self.return_pooled and self.legacy:
             return self.process_hidden_state(z, batch_size)
@@ -468,7 +470,7 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
     def encode_with_transformer(self, text):
         x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
         x = x + self.model.positional_embedding
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        # x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)
         if self.legacy:
             x = x[self.layer]
@@ -494,7 +496,7 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
         outputs = {}
         for i, r in enumerate(self.model.transformer.resblocks):
             if i == len(self.model.transformer.resblocks) - 1:
-                outputs["penultimate"] = x.permute(1, 0, 2)  # LND -> NLD
+                outputs["penultimate"] = x#.permute(1, 0, 2)  # LND -> NLD
             if (
                 self.model.transformer.grad_checkpointing
                 and not torch.jit.is_scripting()
@@ -502,7 +504,7 @@ class FrozenOpenCLIPEmbedder2(AbstractEmbModel):
                 x = checkpoint(r, x, attn_mask)
             else:
                 x = r(x, attn_mask=attn_mask)
-        outputs["last"] = x.permute(1, 0, 2)  # LND -> NLD
+        outputs["last"] = x#.permute(1, 0, 2)  # LND -> NLD
         return outputs
 
     def encode(self, text):

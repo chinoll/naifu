@@ -258,59 +258,61 @@ class Trainer:
             if "schedulefree" in self.optimizer.__class__.__name__.lower():
                 self.optimizer.train()
 
-            for batch_idx, batch in enumerate(self.dataloader):  
+            for batch_idx, batch in enumerate(self.dataloader):
+                print("skip",batch_idx)  
                 # Skip the completed steps in the current epoch
-                local_acc_step = batch_idx // grad_accum_steps + 1
-                if self.current_epoch == resume_epoch and local_acc_step < resume_step:
-                    continue
+                # local_acc_step = batch_idx // grad_accum_steps + 1
+                # pass
+                # if self.current_epoch == resume_epoch and local_acc_step < resume_step:
+                #     continue
                 
-                local_step += 1    
-                local_timer = time.perf_counter()
+                # local_step += 1    
+                # local_timer = time.perf_counter()
                 
-                is_accumulating = local_step % grad_accum_steps != 0
-                fabric_module = getattr(self.model, "model", None)
-                if hasattr(self.model, "get_module"):
-                    fabric_module = self.model.get_module()
+                # is_accumulating = local_step % grad_accum_steps != 0
+                # fabric_module = getattr(self.model, "model", None)
+                # if hasattr(self.model, "get_module"):
+                #     fabric_module = self.model.get_module()
                     
-                with fabric.no_backward_sync(fabric_module, enabled=is_accumulating):
-                # with torch.autograd.detect_anomaly():
-                    loss = self.model(batch)
-                    self.fabric.backward(loss / grad_accum_steps)
+                # with fabric.no_backward_sync(fabric_module, enabled=is_accumulating):
+                # # with torch.autograd.detect_anomaly():
+                #     loss = self.model(batch)
+                #     self.fabric.backward(loss / grad_accum_steps)
 
-                loss = loss.detach().item()
-                loss_rec.add(epoch=self.current_epoch, step=batch_idx, loss=loss)
-                metrics = {
-                    "train/loss": loss,
-                    "trainer/step_t": time.perf_counter() - local_timer,
-                }
-                stat_str = f"train_loss: {loss:.3f}, avg_loss: {loss_rec.avg:.3f}"
-                progress.update(desc, local_acc_step, status=stat_str)
+                # loss = loss.detach().item()
+                # loss_rec.add(epoch=self.current_epoch, step=batch_idx, loss=loss)
+                # metrics = {
+                #     "train/loss": loss,
+                #     "trainer/step_t": time.perf_counter() - local_timer,
+                # }
+                # stat_str = f"train_loss: {loss:.3f}, avg_loss: {loss_rec.avg:.3f}"
+                # progress.update("test", "test", status="test")
                     
-                # skip here if we are accumulating
-                if is_accumulating:
-                    continue
+                # # skip here if we are accumulating
+                # if is_accumulating:
+                #     continue
 
-                if grad_clip_val > 0:
-                    grad_norm = self.fabric.clip_gradients(
-                        module=fabric_module, 
-                        optimizer=self.optimizer, 
-                        max_norm=grad_clip_val
-                    )
-                    if grad_norm is not None:
-                        metrics["train/grad_norm"] = grad_norm
+                # if grad_clip_val > 0:
+                #     grad_norm = self.fabric.clip_gradients(
+                #         module=fabric_module, 
+                #         optimizer=self.optimizer, 
+                #         max_norm=grad_clip_val
+                #     )
+                #     if grad_norm is not None:
+                #         metrics["train/grad_norm"] = grad_norm
 
-                if self.optimizer is not None:
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                # if self.optimizer is not None:
+                #     self.optimizer.step()
+                #     self.optimizer.zero_grad(set_to_none=True)
 
-                if self.scheduler is not None:
-                    is_transformers_sch = "transformers" in config.scheduler.name
-                    fp_batch = self.current_epoch + batch_idx / len(self.dataloader)
-                    actual_step = self.global_step if is_transformers_sch else fp_batch
-                    self.scheduler.step(actual_step)
+                # if self.scheduler is not None:
+                #     is_transformers_sch = "transformers" in config.scheduler.name
+                #     fp_batch = self.current_epoch + batch_idx / len(self.dataloader)
+                #     actual_step = self.global_step if is_transformers_sch else fp_batch
+                #     self.scheduler.step(actual_step)
 
-                if fabric.logger:
-                    fabric.log_dict(metrics=metrics, step=self.global_step)
+                # if fabric.logger:
+                #     fabric.log_dict(metrics=metrics, step=self.global_step)
 
                 self.global_step += 1
                 self.on_post_training_batch()

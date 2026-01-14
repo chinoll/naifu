@@ -146,11 +146,16 @@ class StoreBase(Dataset):
         shape = entries[0].pixel.shape
 
         for e in entries[1:]:
-            assert e.is_latent == is_latent
-            assert (
-                e.pixel.shape == shape
-            ), f"{e.pixel.shape} != {shape} for the same batch"
-
+            try:
+                assert e.is_latent == is_latent
+                assert (
+                    e.pixel.shape == shape
+                ), f"{e.pixel.shape} != {shape} for the same batch"
+            except:
+                print(e)
+                assert (
+                    e.pixel.shape == shape
+                ), f"{e.pixel.shape} != {shape} for the same batch"
         pixel = torch.stack(pixels, dim=0).contiguous()
         cropped_sizes = torch.stack(cropped_sizes)
         original_sizes = torch.stack(original_sizes)
@@ -211,9 +216,13 @@ class StoreBase(Dataset):
 class LatentStore(StoreBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        prompt_mapping = next(dirwalk(self.root_path, lambda p: p.suffix == ".json"))
-        prompt_mapping = json_lib.loads(Path(prompt_mapping).read_text())
-
+        # prompt_mapping = next(dirwalk(self.root_path, lambda p: p.suffix == ".json"))
+        # prompt_mapping = json_lib.loads(Path(prompt_mapping).read_text())
+        prompt_path = list(dirwalk(self.root_path, lambda p: p.suffix == ".json"))
+        # print(prompt_path)
+        prompt_mapping = {}
+        for i in prompt_path:
+            prompt_mapping.update(json.load(open(i)))
         self.h5_paths = list(
             dirwalk(
                 self.root_path,
@@ -232,16 +241,17 @@ class LatentStore(StoreBase):
             leave=False,
             ascii=True,
         )
-
+        allkey = []
         has_h5_loc = "h5_path" in next(iter(prompt_mapping.values()))
         for idx, h5_path in enumerate(self.h5_paths):
-            fs = h5.File(h5_path, "r", libver="latest")
+            fs = h5.File(h5_path, "r", libver="latest", rdcc_nbytes=1024*1024*1024, rdcc_nslots=52009)
             h5_name = h5_path.name
             
             for k in fs.keys():
                 hashkey = k[:-8]  # ".latents"
                 if hashkey not in prompt_mapping:
-                    logger.warning(f"Key {k} not found in prompt_mapping")
+                    # logger.warning(f"Key {k} not found in prompt_mapping")
+                    allkey.append(hashkey)
                     continue
                 
                 it = prompt_mapping[hashkey]
@@ -259,7 +269,6 @@ class LatentStore(StoreBase):
         self.length = len(self.keys)
         self.scale_factor = 0.13025
         logger.debug(f"Loaded {self.length} latent codes from {self.root_path}")
-
         self.keys, self.raw_res, self.paths = self.repeat_entries(self.keys, self.raw_res, index=self.paths)
         new_length = len(self.keys)
         if new_length != self.length:
