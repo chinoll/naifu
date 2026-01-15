@@ -39,13 +39,71 @@ lightning:
   strategy: common.deepspeed._sdxl_strategy
   precision: bf16
 
+'''
+{
+    "e55d59e09ad912c5f6d2a0d521205ea9e313ba65": {
+        "train_use": true,
+        "file_path": "/mnt/raid0/chenkin-noob/danbooru/1_2024/0003/933003.webp",
+        "train_width": 800,
+        "train_height": 2786,
+        "general": "[\"2girls\",\"4koma\",\"^ _ ^\",\"blue_eyes\",\"bow\",\"brown_hair\",\"closed_eyes\",\"comic\",\"crescent\",\"dinosaur\",\"gradient_hair\",\"gun\",\"hat\",\"hat_bow\",\"long_hair\",\"multicolored_hair\",\"multiple_girls\",\"purple_hair\",\"red_hair\",\"tears\",\"unworn_hat\",\"unworn_headwear\",\"weapon\",\"yellow_eyes\",\"yukkuri_shiteitte_ne\"]",
+        "rating": "[\"safe\"]",
+        "artist": "[\"aldehyde\"]",
+        "character": "[\"flandre_scarlet\",\"hijiri_byakuren\",\"kirisame_marisa\",\"kirisame_marisa_(pc-98)\"]",
+        "copyright": "[\"gantz\",\"story_of_eastern_wonderland\",\"touhou\",\"touhou_(pc-98)\"]",
+        "year": "year 2011, oldest",
+        "resolution": "medium resolution",
+        "nsfw": "safe",
+        "aesthetics": null,
+        "character_core_tags": "[\"\"]",
+        "artist_count": 1520.0,
+        "artist_repeat": 0.0,
+        "character_image_count": 1.0,
+        "character_repeat": 1.0,
+        "width": "800",
+        "height": "2786"
+    }
+}
+'''
 dataset:
   name: data.bucket.AspectRatioDataset
   target_area: 1_048_576 # 1024*1024
   img_path: "/dev/shm/danbooru-latent"
   # process_batch_fn: data.processors.shuffle_prompts_sdstyle
   max_token_length: 75 # [75, 150, 225]
-
+  augmentation:
+    data_src: "danbooru"
+    config:
+      character_core_tags_0: 
+        prob: 0.5
+        method: "all"
+      character_core_tags_1: 
+        prob: 0.3
+        method: "elem"
+      resolution_0:
+        prob: 0.7
+        method: "all"
+      year_0:
+        prob: 0.7
+        method: "all"
+      rating_0:
+        prob: 0.7
+        method: "all"
+      aesthetics_0:
+        prob: 0.7
+        method: "all"
+      general_0:
+        prob: 0.2
+        method: "elem"
+      character_0:
+        prob: 0.1
+        method: "all"
+      character_1:
+        data_freq: 500
+        method: "all"
+      artist_0:
+        prob: 0.1
+        method: "all"
 optimizer:
   name: bitsandbytes.optim.AdamW8bit
   params:
