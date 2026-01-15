@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 from typing import Callable, Generator, Optional  # type: ignore
 from torchvision import transforms
 from common.logging import logger
-
+from data.augmentation import TextAugmentation
 json_lib = json
 try:
     import rapidjson as json_lib
@@ -216,6 +216,7 @@ class StoreBase(Dataset):
 class LatentStore(StoreBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.aug = TextAugmentation(kwargs['augmentation'])
         # prompt_mapping = next(dirwalk(self.root_path, lambda p: p.suffix == ".json"))
         # prompt_mapping = json_lib.loads(Path(prompt_mapping).read_text())
         prompt_path = list(dirwalk(self.root_path, lambda p: p.suffix == ".json"))
@@ -288,7 +289,10 @@ class LatentStore(StoreBase):
         h5_path, entry, original_size = self.h5_keymap[latent_key]
         
         # modify here if you want to use a different format
-        prompt = entry["train_caption"]
+        # prompt = entry["train_caption"]
+        metadata = entry["metadata"]
+        data_src = entry["data_src"]
+        prompt = self.aug.apply_to_item(metadata.copy(), data_src=data_src)
         latent = torch.asarray(self.h5_filehandles[h5_path][latent_key][:]).float()
         dhdw = self.h5_filehandles[h5_path][latent_key].attrs.get("dhdw", (0, 0))
     
