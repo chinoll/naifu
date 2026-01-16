@@ -40,11 +40,12 @@ lightning:
   precision: bf16
 
 dataset:
-  name: data.bucket.AdaptiveSizeDataset
-  target_area: 1_048_576 # 1024*1024
-  img_path: "/storage/dev/nyanko/cc"
-  # process_batch_fn: data.processors.shuffle_prompts_sdstyle
-  max_token_length: 225 # [75, 150, 225]
+  name: data.bucket.SimpleLatentDataset
+  img_path: "/storage/dev/nyanko/cc"  # 数据根目录，包含 latents/ 和 metadata.json
+  seed: 42
+  num_workers: 4
+  shuffle: true
+  drop_last: false
 
 optimizer:
   name: torch.optim.AdamW

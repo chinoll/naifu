@@ -1,5 +1,7 @@
 import functools
+import json
 import math
+import os
 import numpy as np
 import random
 import torch
@@ -135,55 +137,345 @@ class RatioDataset(Dataset):
         return self.store.get_batch(img_idxs)
     
 #        return True, latent, prompt, original_size, dhdw, extras
-from torch.utils.data import sampler
+from torch.utils.data import Sampler
+import torch.distributed as dist
 
-class SimpleBucketSampler(sampler):
-    def __init__(self, bucket_indices, batch_size):
+
+class SimpleBucketSampler(Sampler):
+    """分布式感知的Bucket采样器
+    
+    支持多GPU/多节点训练，每个进程只采样属于自己的batch。
+    在单机训练时自动退化为普通采样器。
+    """
+    
+    def __init__(
+        self, 
+        bucket_indices: list,
+        batch_size: int,
+        num_replicas: int = None,
+        rank: int = None,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = False
+    ):
+        """
+        Args:
+            bucket_indices: 每个bucket包含的样本索引列表，如 [[0,1,2], [3,4,5,6]]
+            batch_size: 每个batch的大小
+            num_replicas: 分布式训练的总进程数，None则自动检测
+            rank: 当前进程的rank，None则自动检测
+            shuffle: 是否在每个epoch打乱bucket内的顺序
+            seed: 随机种子
+            drop_last: 是否丢弃最后不完整的batch
+        """
+        # 自动检测分布式环境
+        if num_replicas is None:
+            if dist.is_available() and dist.is_initialized():
+                num_replicas = dist.get_world_size()
+            else:
+                num_replicas = 1
+        
+        if rank is None:
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+            else:
+                rank = 0
+        
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas})"
+            )
+        
         self.bucket_indices = bucket_indices
         self.batch_size = batch_size
-
-    def __iter__(self):
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+        
+        # 预计算总batch数
+        self._compute_num_batches()
+    
+    def _compute_num_batches(self):
+        """计算总batch数和每个进程的batch数"""
+        total_batches = 0
         for indices in self.bucket_indices:
+            if self.drop_last:
+                total_batches += len(indices) // self.batch_size
+            else:
+                total_batches += (len(indices) + self.batch_size - 1) // self.batch_size
+        
+        # 分布式情况下，确保每个进程有相同数量的batch
+        if self.drop_last:
+            self.num_batches = total_batches // self.num_replicas
+        else:
+            self.num_batches = (total_batches + self.num_replicas - 1) // self.num_replicas
+        
+        self.total_batches = self.num_batches * self.num_replicas
+    
+    def set_epoch(self, epoch: int):
+        """设置epoch，用于改变每个epoch的shuffle顺序
+        
+        在分布式训练中，应该在每个epoch开始时调用此方法。
+        """
+        self.epoch = epoch
+    
+    def __iter__(self):
+        # 使用epoch和seed生成随机数生成器
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        
+        # 生成所有batches
+        all_batches = []
+        for indices in self.bucket_indices:
+            if len(indices) == 0:
+                continue
+            
+            indices = list(indices)
+            
+            # 在bucket内shuffle
+            if self.shuffle:
+                perm = torch.randperm(len(indices), generator=g).tolist()
+                indices = [indices[i] for i in perm]
+            
+            # 按batch_size分组
             for i in range(0, len(indices), self.batch_size):
-                yield indices[i : i + self.batch_size]
-
+                batch = indices[i:i + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                all_batches.append(batch)
+        
+        # Shuffle所有batches的顺序
+        if self.shuffle:
+            batch_perm = torch.randperm(len(all_batches), generator=g).tolist()
+            all_batches = [all_batches[i] for i in batch_perm]
+        
+        # Padding以确保所有进程有相同数量的batches
+        if len(all_batches) < self.total_batches:
+            # 重复部分batches来填充
+            padding_size = self.total_batches - len(all_batches)
+            if len(all_batches) > 0:
+                all_batches = all_batches + all_batches[:padding_size]
+            else:
+                # 如果没有任何batch，创建空batch
+                all_batches = [[]] * self.total_batches
+        elif len(all_batches) > self.total_batches:
+            all_batches = all_batches[:self.total_batches]
+        
+        # 分配给当前进程的batches
+        # 使用交错分配方式：rank 0 取 0, num_replicas, 2*num_replicas, ...
+        indices = list(range(self.rank, len(all_batches), self.num_replicas))
+        
+        for idx in indices:
+            yield all_batches[idx]
+    
     def __len__(self):
-        return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.bucket_indices)
+        """返回当前进程的batch数量"""
+        return self.num_batches
 
 class SimpleLatentDataset(Dataset):
-    def __init__(self,data_root,seed):
+    """简单的Latent数据集，用于加载预处理好的latent文件
+    
+    数据目录结构:
+        data_root/
+            latents/
+                resolution_1/  (例如: 512x512)
+                    file1.pt
+                    file2.pt
+                resolution_2/  (例如: 768x512)
+                    file3.pt
+            metadata.json
+    
+    metadata.json 格式:
+        {key: {'prompt': xxx, 'original_size': xxx, 'dhdw': xxx}}
+    """
+    
+    def __init__(
+        self, 
+        batch_size: int,
+        rank: int = 0,
+        dtype = None,
+        data_root: str = None,
+        img_path: str = None,  # 兼容其他 dataset 的参数名
+        seed: int = 42,
+        num_workers: int = 4,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        debug: bool = False,  # debug模式：忽略metadata，使用默认参数
+        **kwargs,  # 忽略其他多余参数
+    ):
+        """
+        Args:
+            batch_size: 每个batch的大小
+            rank: 当前进程的rank（用于分布式训练）
+            dtype: 数据类型（保持接口兼容，实际不使用）
+            data_root: 数据根目录路径
+            img_path: 数据根目录路径（兼容其他dataset的参数名，与data_root二选一）
+            seed: 随机种子
+            num_workers: DataLoader的worker数量
+            shuffle: 是否打乱数据
+            drop_last: 是否丢弃最后不完整的batch
+            **kwargs: 其他参数（忽略）
+        """
         super().__init__()
-        #读取所有分辨率
-        self.buckets = {k:self._dirwalk(os.path.join(data_root,"latents",k)) for k in os.listdir(os.path.join(data_root,"latents"))}
+        
+        # 兼容 data_root 和 img_path 两种参数名
+        self.data_root = data_root or img_path
+        if self.data_root is None:
+            raise ValueError("Must specify either 'data_root' or 'img_path'")
+        
+        self.batch_size = batch_size
+        self.rank = rank
+        self.num_workers = num_workers
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.debug = debug
+        
+        # 读取所有分辨率的latent文件，按bucket组织
+        latents_dir = os.path.join(self.data_root, "latents")
+        self.buckets = {
+            k: self._dirwalk(os.path.join(latents_dir, k)) 
+            for k in os.listdir(latents_dir)
+            if os.path.isdir(os.path.join(latents_dir, k))
+        }
+        
+        # 加载metadata（非debug模式）
+        # 格式：{key: {'prompt': xxx, 'original_size': xxx, 'dhdw': xxx}}
+        if not self.debug:
+            metadata_path = os.path.join(self.data_root, "metadata.json")
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                self.metadata = json.load(f)
+        else:
+            self.metadata = {}  # debug模式下不加载metadata
+            logger.info("Debug mode: skipping metadata loading")
+        
+        # 构建文件列表和bucket索引
         self.files = []
-        self.metadata = json.load(open(os.path.join(data_root,"metadata.json")))
-        for v in self.buckets:
-            self.files.extend(v)
-        self.batch_size
-    def _dirwalk(self,path):
-        logger.warning(f"read {path}")
+        self.bucket_indices = []  # 用于SimpleBucketSampler
+        missing_keys = []
+        
+        for resolution, files in self.buckets.items():
+            bucket_valid_indices = []
+            for filepath in files:
+                key = Path(filepath).stem
+                # debug模式下不验证key，直接添加
+                if self.debug or key in self.metadata:
+                    bucket_valid_indices.append(len(self.files))
+                    self.files.append(filepath)
+                else:
+                    missing_keys.append(key)
+            
+            if bucket_valid_indices:
+                self.bucket_indices.append(bucket_valid_indices)
+        
+        if missing_keys and not self.debug:
+            logger.warning(f"Found {len(missing_keys)} files without metadata, skipping them")
+            if len(missing_keys) <= 10:
+                logger.warning(f"Missing keys: {missing_keys}")
+            else:
+                logger.warning(f"First 10 missing keys: {missing_keys[:10]}")
+        
+        logger.info(f"Loaded {len(self.files)} latent files from {len(self.bucket_indices)} buckets")
+    
+    def _dirwalk(self, path):
+        """递归遍历目录，获取所有.pt文件"""
+        logger.info(f"Reading latents from: {path}")
         path = Path(path)
         return [str(file) for file in path.rglob('*.pt') if file.is_file()]
-    def __getitem__(self,index):
+    
+    def __len__(self):
+        return len(self.files)
+    
+    def __getitem__(self, index):
         filepath = self.files[index]
-        key = Path(filepath).stem
-        return True,torch.load(filepath), self.metadata[key]['prompt'], self.metadata[key]['original_size'], self.metadata[key]['dhdw'], None
+        latent = torch.load(filepath, weights_only=True)
+        
+        if self.debug:
+            # debug模式：使用默认值
+            # original_size 和 dhdw 使用 (0, 0)，prompt 为空
+            return True, latent, "", (0, 0), (0, 0), None
+        else:
+            key = Path(filepath).stem
+            meta = self.metadata[key]
+            return True, latent, meta['prompt'], meta['original_size'], meta['dhdw'], None
+    
     @staticmethod
     def simple_collate_fn(batch):
-        pass
+        """将batch中的数据整合为统一格式，与StoreBase.get_batch返回格式一致
+        
+        Args:
+            batch: list of (is_latent, latent, prompt, original_size, dhdw, extras)
+        
+        Returns:
+            dict with keys: prompts, pixels, is_latent, target_size_as_tuple,
+                           original_size_as_tuple, crop_coords_top_left, extras
+        """
+        is_latents, latents, prompts, original_sizes, dhdws, extras = zip(*batch)
+        
+        # Stack latents (假设同一bucket内latent尺寸相同)
+        pixels = torch.stack(latents, dim=0)
+        
+        # 获取 is_latent（所有项应该相同）
+        is_latent = is_latents[0]
+        
+        # 计算 target_size_as_tuple (latent shape * 8 得到像素尺寸)
+        # latent shape: (C, H, W) -> target_size: (H*8, W*8)
+        latent_h, latent_w = pixels.shape[-2:]
+        if is_latent:
+            target_h, target_w = latent_h * 8, latent_w * 8
+        else:
+            target_h, target_w = latent_h, latent_w
+        
+        batch_size = len(is_latents)
+        target_sizes = torch.tensor([[target_h, target_w]] * batch_size)
+        
+        # original_size 转为 tensor
+        original_sizes = torch.tensor(original_sizes)
+        
+        # crop_coords_top_left: dhdw 需要乘以 8（如果是 latent）
+        dhdws_list = list(dhdws)
+        if is_latent:
+            crop_coords = torch.tensor([[dh * 8, dw * 8] for dh, dw in dhdws_list])
+        else:
+            crop_coords = torch.tensor(dhdws_list)
+        
+        return {
+            "prompts": list(prompts),
+            "pixels": pixels,
+            "is_latent": is_latent,
+            "target_size_as_tuple": target_sizes,
+            "original_size_as_tuple": original_sizes,
+            "crop_coords_top_left": crop_coords,
+            "extras": list(extras),
+        }
+    
     def init_dataloader(self, **kwargs):
-        #todo
-        sampler = SimpleBucketSampler()
+        """初始化DataLoader
+        
+        Returns:
+            torch.utils.data.DataLoader
+        """
+        sampler = SimpleBucketSampler(
+            bucket_indices=self.bucket_indices,
+            batch_size=self.batch_size,
+            rank=self.rank,  # 传递 rank 参数用于分布式
+            shuffle=self.shuffle,
+            seed=self.seed,
+            drop_last=self.drop_last,
+        )
+        
         dataloader = torch.utils.data.DataLoader(
             self,
-            sampler=sampler,
-            batch_size=self.batch_size,
+            batch_sampler=sampler,  # 使用batch_sampler而非sampler
             num_workers=self.num_workers,
-            worker_init_fn=worker_init_fn,
-            shuffle=True,
+            collate_fn=self.simple_collate_fn,
             pin_memory=True,
             **kwargs,
         )
+        return dataloader
 
 class AspectRatioDataset(RatioDataset):
     """Original implementation of AspectRatioDataset, equal to other frameworks"""
