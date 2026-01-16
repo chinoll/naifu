@@ -80,7 +80,7 @@ def setup(fabric: pl.Fabric, config: OmegaConf) -> tuple:
     if hasattr(model, "mark_forward_method"):
         model.mark_forward_method('generate_samples')
 
-    dataloader = fabric.setup_dataloaders(dataloader)
+    dataloader = fabric.setup_dataloaders(dataloader, use_distributed_sampler=False)
     model._fabric_wrapped = fabric
     return model, dataset, dataloader, optimizer, scheduler
 
