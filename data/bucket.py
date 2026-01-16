@@ -134,7 +134,57 @@ class RatioDataset(Dataset):
         img_idxs = self.batch_idxs[idx]
         return self.store.get_batch(img_idxs)
     
-    
+#        return True, latent, prompt, original_size, dhdw, extras
+from torch.utils.data import sampler
+
+class SimpleBucketSampler(sampler):
+    def __init__(self, bucket_indices, batch_size):
+        self.bucket_indices = bucket_indices
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        for indices in self.bucket_indices:
+            for i in range(0, len(indices), self.batch_size):
+                yield indices[i : i + self.batch_size]
+
+    def __len__(self):
+        return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.bucket_indices)
+
+class SimpleLatentDataset(Dataset):
+    def __init__(self,data_root,seed):
+        super().__init__()
+        #读取所有分辨率
+        self.buckets = {k:self._dirwalk(os.path.join(data_root,"latents",k)) for k in os.listdir(os.path.join(data_root,"latents"))}
+        self.files = []
+        self.metadata = json.load(open(os.path.join(data_root,"metadata.json")))
+        for v in self.buckets:
+            self.files.extend(v)
+        self.batch_size
+    def _dirwalk(self,path):
+        logger.warning(f"read {path}")
+        path = Path(path)
+        return [str(file) for file in path.rglob('*.pt') if file.is_file()]
+    def __getitem__(self,index):
+        filepath = self.files[index]
+        key = Path(filepath).stem
+        return True,torch.load(filepath), self.metadata[key]['prompt'], self.metadata[key]['original_size'], self.metadata[key]['dhdw'], None
+    @staticmethod
+    def simple_collate_fn(batch):
+        pass
+    def init_dataloader(self, **kwargs):
+        #todo
+        sampler = SimpleBucketSampler()
+        dataloader = torch.utils.data.DataLoader(
+            self,
+            sampler=sampler,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            worker_init_fn=worker_init_fn,
+            shuffle=True,
+            pin_memory=True,
+            **kwargs,
+        )
+
 class AspectRatioDataset(RatioDataset):
     """Original implementation of AspectRatioDataset, equal to other frameworks"""
     def __init__(
