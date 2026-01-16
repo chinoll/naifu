@@ -202,10 +202,21 @@ class SimpleBucketSampler(Sampler):
         """计算总batch数和每个进程的batch数"""
         total_batches = 0
         for indices in self.bucket_indices:
+            # 处理 Lightning Fabric 重新实例化时可能传入的不同类型
+            if isinstance(indices, int):
+                # 如果 indices 是 int，说明 bucket_indices 可能是一个简单的范围
+                # 此时直接跳过计算，使用默认值
+                continue
             if self.drop_last:
                 total_batches += len(indices) // self.batch_size
             else:
                 total_batches += (len(indices) + self.batch_size - 1) // self.batch_size
+        
+        # 如果没有有效的 bucket，设置默认值
+        if total_batches == 0:
+            self.num_batches = 0
+            self.total_batches = 0
+            return
         
         # 分布式情况下，确保每个进程有相同数量的batch
         if self.drop_last:
