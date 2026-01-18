@@ -5,6 +5,8 @@ import os
 import numpy as np
 import random
 import torch
+import h5py
+import re
 from collections import defaultdict
 
 import cv2
@@ -287,20 +289,18 @@ class SimpleBucketSampler(Sampler):
         return self.num_batches
 
 class SimpleLatentDataset(Dataset):
-    """简单的Latent数据集，用于加载预处理好的latent文件
+    """简单的Latent数据集，用于加载预处理好的latent文件 (HDF5 version)
     
     数据目录结构:
         data_root/
-            latents/
-                resolution_1/  (例如: 512x512)
-                    file1.pt
-                    file2.pt
-                resolution_2/  (例如: 768x512)
-                    file3.pt
-            metadata.json
+            1024x1024_rank0.h5
+            1024x1024_rank1.h5
+            ...
+            metadata.jsonl
     
-    metadata.json 格式:
-        {key: {'prompt': xxx, 'original_size': xxx, 'dhdw': xxx}}
+    metadata.jsonl 格式 (JSON Lines):
+        {"sha1_key": {'prompt': xxx, 'original_size': xxx, 'dhdw': xxx, ...}}
+        或者每一行是一个 JSON 对象，包含 key 和 value。
     """
     
     def __init__(
@@ -314,25 +314,11 @@ class SimpleLatentDataset(Dataset):
         num_workers: int = 4,
         shuffle: bool = True,
         drop_last: bool = False,
-        debug: bool = False,  # debug模式：忽略metadata，使用默认参数
-        **kwargs,  # 忽略其他多余参数
+        debug: bool = False,
+        **kwargs,
     ):
-        """
-        Args:
-            batch_size: 每个batch的大小
-            rank: 当前进程的rank（用于分布式训练）
-            dtype: 数据类型（保持接口兼容，实际不使用）
-            data_root: 数据根目录路径
-            img_path: 数据根目录路径（兼容其他dataset的参数名，与data_root二选一）
-            seed: 随机种子
-            num_workers: DataLoader的worker数量
-            shuffle: 是否打乱数据
-            drop_last: 是否丢弃最后不完整的batch
-            **kwargs: 其他参数（忽略）
-        """
         super().__init__()
         
-        # 兼容 data_root 和 img_path 两种参数名
         self.data_root = data_root or img_path
         if self.data_root is None:
             raise ValueError("Must specify either 'data_root' or 'img_path'")
@@ -344,75 +330,100 @@ class SimpleLatentDataset(Dataset):
         self.drop_last = drop_last
         self.seed = seed
         self.debug = debug
+        self.archives = {} # Lazy loaded h5 handles
         
-        # 读取所有分辨率的latent文件，按bucket组织
-        latents_dir = os.path.join(self.data_root, "latents")
-        self.buckets = {
-            k: self._dirwalk(os.path.join(latents_dir, k)) 
-            for k in os.listdir(latents_dir)
-            if os.path.isdir(os.path.join(latents_dir, k))
-        }
-        
-        # 加载metadata（非debug模式）
-        # 格式：{key: {'prompt': xxx, 'original_size': xxx, 'dhdw': xxx}}
+        # 加载 metadata
+        self.metadata = {}
         if not self.debug:
-            metadata_path = os.path.join(self.data_root, "metadata.json")
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                self.metadata = json.load(f)
-        else:
-            self.metadata = {}  # debug模式下不加载metadata
-            logger.info("Debug mode: skipping metadata loading")
-        
-        # 构建文件列表和bucket索引
-        self.files = []
-        self.bucket_indices = []  # 用于SimpleBucketSampler
-        missing_keys = []
-        
-        for resolution, files in self.buckets.items():
-            bucket_valid_indices = []
-            for filepath in files:
-                key = Path(filepath).stem
-                # debug模式下不验证key，直接添加
-                if self.debug or key in self.metadata:
-                    bucket_valid_indices.append(len(self.files))
-                    self.files.append(filepath)
-                else:
-                    missing_keys.append(key)
-            
-            if bucket_valid_indices:
-                self.bucket_indices.append(bucket_valid_indices)
-        
-        if missing_keys and not self.debug:
-            logger.warning(f"Found {len(missing_keys)} files without metadata, skipping them")
-            if len(missing_keys) <= 10:
-                logger.warning(f"Missing keys: {missing_keys}")
+            meta_path = os.path.join(self.data_root, "metadata.jsonl")
+            logger.info(f"Loading metadata from {meta_path}")
+            if os.path.exists(meta_path):
+                # 尝试逐行读取
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    for line in tqdm(f):
+                        line = line.strip()
+                        if not line: continue
+                        try:
+                            # 假设每一行是一个 JSON 对象，或者是 {"key": val} 形式
+                            # 根据用户描述 {"469b...": {...}}，如果是单行大 JSON，这里也能处理（如果内存够）
+                            # 但如果是 JSONL，通常是多行。
+                            entry = json.loads(line)
+                            self.metadata.update(entry)
+                        except Exception as e:
+                            logger.warning(f"Failed to parse metadata line: {e}")
             else:
-                logger.warning(f"First 10 missing keys: {missing_keys[:10]}")
+                logger.warning(f"Metadata file not found: {meta_path}")
+
+        # 扫描 HDF5 文件
+        # 按照文件名中的分辨率进行分组，例如 "1024x1024_rank0.h5" -> "1024x1024"
+        h5_files = sorted([str(p) for p in Path(self.data_root).glob("*.h5")])
+        files_by_res = defaultdict(list)
         
-        logger.info(f"Loaded {len(self.files)} latent files from {len(self.bucket_indices)} buckets")
-    
-    def _dirwalk(self, path):
-        """递归遍历目录，获取所有.pt文件"""
-        logger.info(f"Reading latents from: {path}")
-        path = Path(path)
-        return [str(file) for file in path.rglob('*.pt') if file.is_file()]
-    
-    def __len__(self):
-        return len(self.files)
-    
+        for p in h5_files:
+            match = re.search(r"(\d+x\d+)", Path(p).name)
+            if match:
+                res = match.group(1)
+                files_by_res[res].append(p)
+            else:
+                logger.warning(f"Skipping file with unknown resolution format: {p}")
+
+        self.items = [] # list of (h5_path, key)
+        self.bucket_indices = []
+        
+        logger.info(f"Found {len(h5_files)} HDF5 files, grouped into {len(files_by_res)} resolutions.")
+        
+        for res, paths in files_by_res.items():
+            bucket_idxs = []
+            for path in paths:
+                try:
+                    # 我们只需要读取 keys，不需要保持文件打开
+                    with h5py.File(path, 'r') as f:
+                        keys = list(f.keys())
+                except Exception as e:
+                    logger.error(f"Failed to read keys from {path}: {e}")
+                    continue
+                
+                for key in keys:
+                    if not self.debug and key not in self.metadata:
+                        continue
+                    
+                    self.items.append((path, key))
+                    bucket_idxs.append(len(self.items) - 1)
+            
+            if bucket_idxs:
+                self.bucket_indices.append(bucket_idxs)
+        
+        logger.info(f"Total items: {len(self.items)} in {len(self.bucket_indices)} buckets.")
+
     def __getitem__(self, index):
-        filepath = self.files[index]
-        latent = torch.load(filepath, weights_only=True)
+        h5_path, key = self.items[index]
+        
+        # Lazy loading of HDF5 file
+        if h5_path not in self.archives:
+            # 注意：在多进程 DataLoader 中，每个 worker 都会有自己的 SimpleLatentDataset 副本
+            # 所以这里的 self.archives 是 worker-local 的
+            self.archives[h5_path] = h5py.File(h5_path, 'r')
+            
+        f = self.archives[h5_path]
+        # 读取 latent，dataset[()] 读取为 numpy array
+        latent = torch.from_numpy(f[key][()])
         
         if self.debug:
-            # debug模式：使用默认值
-            # original_size 和 dhdw 使用 (0, 0)，prompt 为空
             return True, latent, "", (0, 0), (0, 0), None
         else:
-            key = Path(filepath).stem
             meta = self.metadata[key]
-            return True, latent, meta['prompt'], meta['original_size'], meta['dhdw'], None
+            # metadata 包含: prompt, original_size, dhdw 等
+            return True, latent, meta.get('prompt', ''), meta.get('original_size', [0, 0]), meta.get('dhdw', [0, 0]), None
     
+    def __del__(self):
+        # 尝试关闭所有打开的文件句柄
+        if hasattr(self, 'archives'):
+            for f in self.archives.values():
+                try:
+                    f.close()
+                except:
+                    pass
+
     @staticmethod
     def simple_collate_fn(batch):
         """将batch中的数据整合为统一格式，与StoreBase.get_batch返回格式一致
