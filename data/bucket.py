@@ -354,11 +354,23 @@ class SimpleLatentDataset(Dataset):
         }
         
         # 加载metadata（非debug模式）
-        # 格式：{key: {'prompt': xxx, 'original_size': xxx, 'dhdw': xxx}}
+        # 支持两种格式：
+        # - metadata.jsonl: 每行一条记录，格式 {"sha1": {"prompt": xxx, "original_size": xxx, "dhdw": xxx}}
         if not self.debug:
-            metadata_path = os.path.join(self.data_root, "metadata.json")
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                self.metadata = json.load(f)
+            jsonl_path = os.path.join(self.data_root, "metadata.jsonl")
+            
+            if os.path.exists(jsonl_path):
+                # 加载 JSONL 格式
+                self.metadata = {}
+                with open(jsonl_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            record = json.loads(line)
+                            self.metadata.update(record)
+                logger.info(f"Loaded metadata from JSONL: {jsonl_path}")
+            else:
+                raise FileNotFoundError(f"No metadata file found. Expected: {jsonl_path}")
         else:
             self.metadata = {}  # debug模式下不加载metadata
             logger.info("Debug mode: skipping metadata loading")
