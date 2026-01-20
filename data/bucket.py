@@ -439,10 +439,10 @@ class SimpleLatentDataset(Dataset):
     }
     
     def _dirwalk(self, path):
-        """递归遍历目录，获取所有.pt文件"""
+        """递归遍历目录，获取所有.npy文件"""
         logger.info(f"Reading latents from: {path}")
         path = Path(path)
-        return [str(file) for file in path.rglob('*.pt') if file.is_file()]
+        return [str(file) for file in path.rglob('*.npy') if file.is_file()]
     
     def apply_tag_dropout(self, meta: dict) -> str:
         """应用 tag dropout 生成最终的 prompt
@@ -590,7 +590,8 @@ class SimpleLatentDataset(Dataset):
     
     def __getitem__(self, index):
         filepath = self.files[index]
-        latent = torch.load(filepath, weights_only=True)
+        # 加载 .npy 文件并转换为 tensor
+        latent = torch.from_numpy(np.load(filepath))
         
         if self.debug:
             # debug模式：使用默认值
