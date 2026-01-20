@@ -386,8 +386,20 @@ class SimpleLatentDataset(Dataset):
                 key = Path(filepath).stem
                 # debug模式下不验证key，直接添加
                 if self.debug or key in self.metadata:
-                    bucket_valid_indices.append(len(self.files))
-                    self.files.append(filepath)
+                    # 计算repeat次数：取所有以_repeat结尾的字段的最大值，默认为1
+                    repeat_count = 1
+                    if not self.debug and key in self.metadata:
+                        meta = self.metadata[key]
+                        # 支持 metadata 字段在顶层或 metadata 子对象中
+                        meta_dict = meta.get('metadata', meta) if isinstance(meta.get('metadata'), dict) else meta
+                        for field_key, value in meta_dict.items():
+                            if field_key.endswith('_repeat') and isinstance(value, (int, float)):
+                                repeat_count = max(repeat_count, int(value))
+                    
+                    # 根据repeat次数添加多次
+                    for _ in range(repeat_count):
+                        bucket_valid_indices.append(len(self.files))
+                        self.files.append(filepath)
                 else:
                     missing_keys.append(key)
             
@@ -403,11 +415,175 @@ class SimpleLatentDataset(Dataset):
         
         logger.info(f"Loaded {len(self.files)} latent files from {len(self.bucket_indices)} buckets")
     
+    # 默认的 tag dropout 配置
+    DEFAULT_TAG_DROPOUT_CONFIG = {
+        "danbooru": {
+            "character_drop": 0.1,
+            "core_whole_drop": 0.5,
+            "general_in_core_drop": 0.3,
+            "general_not_core_drop": 0.2,
+            "other_drop": 0.7,
+        },
+        "e621": {
+            "copyright_drop": 0.5,
+            "character_drop": 0.2,
+            "species_drop": 0.2,
+            "general_drop": 0.7,
+            "e621_tag_drop": 0.2,
+            "resolution_drop": 0.7,
+            "nsfw_drop": 0.7,
+        },
+        "txt": {
+            "tag_drop": 0.5,
+        }
+    }
+    
     def _dirwalk(self, path):
         """递归遍历目录，获取所有.pt文件"""
         logger.info(f"Reading latents from: {path}")
         path = Path(path)
         return [str(file) for file in path.rglob('*.pt') if file.is_file()]
+    
+    def apply_tag_dropout(self, meta: dict) -> str:
+        """应用 tag dropout 生成最终的 prompt
+        
+        Args:
+            meta: 元数据字典，包含 prompt, metadata, data_src 等字段
+        
+        Returns:
+            处理后的 prompt 字符串
+        """
+        # 检查是否有 metadata 字段（相当于旧的 from_parquet）
+        if "metadata" in meta and isinstance(meta.get("metadata"), dict):
+            t = meta["metadata"]
+            data_src = meta.get("data_src", "danbooru")
+            final_components = []
+            
+            if data_src == "e621":
+                cfg = self.DEFAULT_TAG_DROPOUT_CONFIG["e621"]
+                
+                # Copyrights: 50% 概率全部丢弃
+                val_copy = t.get("copyright", [])
+                if val_copy and random.random() >= cfg["copyright_drop"]:
+                    final_components.append(", ".join(val_copy))
+                
+                # Characters: 20% 概率全部丢弃
+                val_char = t.get("character", [])
+                if val_char and random.random() >= cfg["character_drop"]:
+                    final_components.append(", ".join(val_char))
+                
+                # Species: 随机丢弃 20% tag
+                species_list = t.get("species", [])
+                if species_list:
+                    kept_s = [s for s in species_list if random.random() >= cfg["species_drop"]]
+                    if kept_s:
+                        final_components.append(", ".join(kept_s))
+                
+                # General: 随机丢弃 70% tag
+                gen_list = t.get("general", [])
+                if gen_list:
+                    kept_g = [g for g in gen_list if random.random() >= cfg["general_drop"]]
+                    if kept_g:
+                        final_components.append(", ".join(kept_g))
+                
+                # e621 tag: 20% 丢弃
+                val_e621 = t.get("e621_tag", [])
+                if val_e621 and random.random() >= cfg["e621_tag_drop"]:
+                    if isinstance(val_e621, list):
+                        final_components.append(", ".join(val_e621))
+                    else:
+                        final_components.append(str(val_e621))
+                
+                # 分辨率: 70% 概率丢弃
+                val_res = t.get("resolution", "")
+                if val_res and random.random() >= cfg["resolution_drop"]:
+                    final_components.append(str(val_res))
+                
+                # NSFW: 70% 丢弃
+                val_nsfw = t.get("nsfw", "")
+                if val_nsfw and random.random() >= cfg["nsfw_drop"]:
+                    final_components.append(str(val_nsfw))
+            
+            else:  # danbooru 或其他
+                cfg = self.DEFAULT_TAG_DROPOUT_CONFIG["danbooru"]
+                
+                # Characters: 使用 character_image_count 动态计算 dropout
+                chars = t.get("character", [])
+                char_count = t.get("character_image_count", 0)
+                kept_chars = []
+                for c in chars:
+                    if char_count > 500:
+                        prob = round(1.0 - (500.0 / char_count), 2)
+                        prob = max(0.0, min(prob, 0.95))
+                    else:
+                        prob = cfg["character_drop"]
+                    if random.random() >= prob:
+                        kept_chars.append(c)
+                if kept_chars:
+                    final_components.append(", ".join(kept_chars))
+                
+                # Artists: 使用 artist_count 动态计算 dropout
+                artists = t.get("artist", [])
+                artist_count = t.get("artist_count", 0)
+                kept_artists = []
+                for a in artists:
+                    if artist_count > 500:
+                        prob = round(1.0 - (500.0 / artist_count), 2)
+                        prob = max(0.0, min(prob, 0.95))
+                    else:
+                        prob = cfg["character_drop"]  # 使用相同的基础 dropout
+                    if random.random() >= prob:
+                        kept_artists.append(a)
+                if kept_artists:
+                    final_components.append(", ".join(kept_artists))
+                
+                # Copyright
+                copy_val = t.get("copyright", [])
+                if copy_val and random.random() >= cfg["character_drop"]:
+                    final_components.append(", ".join(copy_val))
+                
+                # General tags: 区分 core 和 non-core
+                gen_list = t.get("general", [])
+                if gen_list:
+                    core_tags = set(t.get("character_core_tags", []))
+                    in_core = [tag for tag in gen_list if tag in core_tags]
+                    not_in_core = [tag for tag in gen_list if tag not in core_tags]
+                    kept_general = []
+                    if random.random() >= cfg["core_whole_drop"]:
+                        kept_general.extend([tag for tag in in_core if random.random() >= cfg["general_in_core_drop"]])
+                    kept_general.extend([tag for tag in not_in_core if random.random() >= cfg["general_not_core_drop"]])
+                    if kept_general:
+                        final_components.append(", ".join(kept_general))
+                
+                # 其他 meta 字段
+                meta_keys = ["rating", "year", "resolution", "nsfw", "aesthetics"]
+                for k in meta_keys:
+                    val = t.get(k, "")
+                    if val and random.random() >= cfg["other_drop"]:
+                        if isinstance(val, list):
+                            final_components.append(", ".join(val))
+                        else:
+                            final_components.append(str(val))
+            
+            # 最终处理：替换下划线，打乱顺序
+            final_components = [c.replace("_", " ") for c in final_components if c]
+            random.shuffle(final_components)
+            return ", ".join(final_components)
+        
+        else:
+            # 没有 metadata 字段，使用 prompt 字段并应用 txt dropout
+            original_prompt = meta.get("prompt", "")
+            if not original_prompt:
+                return ""
+            
+            cfg_txt = self.DEFAULT_TAG_DROPOUT_CONFIG["txt"]
+            tag_list = [tag.strip() for tag in original_prompt.split(",") if tag.strip()]
+            kept_tags = [tag for tag in tag_list if random.random() >= cfg_txt["tag_drop"]]
+            
+            kept_tags = [t.replace("_", " ") for t in kept_tags]
+            random.shuffle(kept_tags)
+            
+            return ", ".join(kept_tags)
     
     def __len__(self):
         return len(self.files)
@@ -423,7 +599,9 @@ class SimpleLatentDataset(Dataset):
         else:
             key = Path(filepath).stem
             meta = self.metadata[key]
-            return True, latent, meta['prompt'], meta['original_size'], meta['dhdw'], None
+            # 使用 apply_tag_dropout 动态生成 prompt
+            prompt = self.apply_tag_dropout(meta)
+            return True, latent, prompt, meta['original_size'], meta['dhdw'], None
     
     @staticmethod
     def simple_collate_fn(batch):
