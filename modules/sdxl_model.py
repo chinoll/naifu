@@ -208,10 +208,9 @@ class StableDiffusionModel(pl.LightningModule):
             all_prompts = []
             for entry in gathered_images:
                 if isinstance(entry, list):
-                    entry = entry[0]
-                imgs, prompts = entry
-                all_prompts.append(prompts)
-                all_images.append(imgs)
+                    for imgs, prompts in entry:
+                        all_prompts.append(prompts)
+                        all_images.append(imgs)
 
             if config.use_wandb and logger and "CSVLogger" != logger.__class__.__name__:
                 logger.log_image(
