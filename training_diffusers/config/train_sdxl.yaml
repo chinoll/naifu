@@ -1,0 +1,116 @@
+# SDXL Training Configuration (Diffusers + Accelerate)
+# 
+# Usage:
+#   python training_diffusers/train_sdxl.py --config training_diffusers/config/train_sdxl.yaml
+#   accelerate launch training_diffusers/train_sdxl.py --config training_diffusers/config/train_sdxl.yaml
+
+name: sdxl-diffusers-training
+
+trainer:
+  # Model path: can be HuggingFace Hub ID or local path
+  # - HF format: "stabilityai/stable-diffusion-xl-base-1.0" or "/path/to/diffusers_model/"
+  # - Single file: "/path/to/model.safetensors" or "/path/to/model.ckpt"
+  model_path: stabilityai/stable-diffusion-xl-base-1.0
+  
+  batch_size: 4
+  seed: 42
+  wandb_id: ""  # Set to enable W&B logging
+  
+  # Gradient settings
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  
+  # Checkpointing
+  checkpoint_dir: checkpoints
+  checkpoint_freq: 1        # Save every N epochs (-1 to disable)
+  checkpoint_steps: -1      # Save every N steps (-1 to disable)
+  
+  # Training duration
+  max_epochs: 10
+  max_steps: -1             # -1 = no limit
+
+# Accelerate settings (used by Accelerator)
+accelerate:
+  mixed_precision: bf16     # fp16, bf16, or no
+
+# Advanced training options
+advanced:
+  train_text_encoder_1: false
+  train_text_encoder_2: false
+  text_encoder_1_lr: 1e-6
+  text_encoder_2_lr: 1e-6
+  
+  gradient_checkpointing: true
+  use_xformers: false          # Enable xformers memory efficient attention
+  
+  # CFG training (condition dropout)
+  condition_dropout_rate: 0.1  # 0.0 to disable, 0.1 = 10% unconditional
+  
+  # Noise settings
+  offset_noise: true
+  offset_noise_val: 0.0375
+  
+  # SNR weighting
+  min_snr: true
+  min_snr_val: 5
+  
+  # Timestep sampling
+  timestep_start: 0
+  timestep_end: 1000
+  timestep_sampler_type: uniform  # uniform or logit_normal
+  timestep_sampler_mean: 0        # for logit_normal
+  timestep_sampler_std: 1         # for logit_normal
+  
+  # Prediction type
+  v_parameterization: false
+
+# Dataset (SimpleLatentDataset)
+dataset:
+  data_root: /path/to/latent_data  # Contains latents/ folder and metadata.jsonl
+  max_token_length: 77
+  seed: 42
+  num_workers: 4
+  shuffle: true
+  drop_last: false
+  debug: false
+
+# Optimizer
+# Supported: torch.optim.*, bitsandbytes.optim.*
+optimizer:
+  name: torch.optim.AdamW
+  params:
+    lr: 1e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    eps: 1e-8
+
+# Alternative: 8-bit AdamW (saves ~50% optimizer memory)
+# optimizer:
+#   name: bitsandbytes.optim.AdamW8bit
+#   params:
+#     lr: 1e-5
+#     betas: [0.9, 0.999]
+#     weight_decay: 0.01
+
+# Learning rate scheduler
+scheduler:
+  name: transformers.get_cosine_schedule_with_warmup
+  params:
+    num_warmup_steps: 100
+    num_training_steps: -1  # Auto-calculated
+
+# Sampling configuration
+sampling:
+  enabled: false
+  use_wandb: true
+  seed: 42
+  height: 1024
+  width: 1024
+  steps: 25
+  guidance_scale: 7.0
+  every_n_steps: -1         # Sample every N steps (-1 to disable)
+  every_n_epochs: 1         # Sample every N epochs (-1 to disable)
+  save_dir: samples
+  prompts:
+    - "1girl, solo, masterpiece, best quality, detailed eyes"
+    - "1boy, solo, masterpiece, best quality, realistic"
