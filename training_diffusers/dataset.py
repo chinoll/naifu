@@ -127,6 +127,197 @@ class SimpleBucketSampler(Sampler):
     def __len__(self):
         return self.num_batches
 
+
+class SimpleBucketSamplerForHttp(Sampler):
+    """HTTP-based Bucket Sampler that delegates sampling to server.
+    
+    This sampler:
+    1. Sends epoch_id, batch_size, rank to server
+    2. Server computes indices and returns batch data
+    3. Sampler just iterates through server responses
+    
+    Server API:
+        GET /dataset/sample?epoch={epoch}&batch_size={bs}&rank={rank}&num_replicas={n}
+        -> Returns iterator info: {"num_batches": int}
+        
+        GET /dataset/next_batch?epoch={epoch}&batch_idx={idx}&rank={rank}
+        -> Returns batch data directly
+    
+    Use with EmptyLatentDataset as placeholder.
+    """
+    
+    def __init__(
+        self,
+        server_url: str,
+        batch_size: int,
+        num_replicas: int = None,
+        rank: int = None,
+        timeout: float = 30.0,
+        http2: bool = True,
+    ):
+        # Distributed setup
+        if num_replicas is None:
+            if dist.is_available() and dist.is_initialized():
+                num_replicas = dist.get_world_size()
+            else:
+                num_replicas = 1
+        
+        if rank is None:
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+            else:
+                rank = 0
+        
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(f"Invalid rank {rank}, rank should be in [0, {num_replicas})")
+        
+        self.server_url = server_url.rstrip('/')
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.timeout = timeout
+        self.http2 = http2
+        self.epoch = 0
+        self._num_batches = None
+        
+        # JSON handling
+        try:
+            import orjson
+            self._json_loads = orjson.loads
+        except ImportError:
+            self._json_loads = json.loads
+        
+        # Fetch initial info
+        self._init_epoch()
+    
+    def _get_client(self):
+        """Get or create HTTP client"""
+        if not hasattr(self, '_client') or self._client is None:
+            import httpx
+            limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+            self._client = httpx.Client(
+                base_url=self.server_url,
+                timeout=httpx.Timeout(self.timeout),
+                limits=limits,
+                http2=self.http2,
+            )
+        return self._client
+    
+    def _init_epoch(self):
+        """Initialize epoch and get num_batches from server"""
+        client = self._get_client()
+        
+        try:
+            response = client.get(
+                "/dataset/sample",
+                params={
+                    "epoch": self.epoch,
+                    "batch_size": self.batch_size,
+                    "rank": self.rank,
+                    "num_replicas": self.num_replicas,
+                }
+            )
+            response.raise_for_status()
+            info = self._json_loads(response.content)
+            self._num_batches = info["num_batches"]
+            logger.info(f"SimpleBucketSamplerForHttp: epoch={self.epoch}, num_batches={self._num_batches}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to init epoch from {self.server_url}: {e}")
+    
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+        self._init_epoch()
+    
+    def __iter__(self):
+        client = self._get_client()
+        
+        for batch_idx in range(self._num_batches):
+            try:
+                response = client.get(
+                    "/dataset/next_batch",
+                    params={
+                        "epoch": self.epoch,
+                        "batch_idx": batch_idx,
+                        "rank": self.rank,
+                    }
+                )
+                response.raise_for_status()
+                batch_data = self._json_loads(response.content)
+                
+                # Load latents and collate
+                latents = []
+                prompts = []
+                original_sizes = []
+                dhdws = []
+                extras_list = []
+                
+                for data in batch_data:
+                    latent_path = data["latent_path"]
+                    latent = torch.from_numpy(np.load(latent_path))
+                    latents.append(latent)
+                    prompts.append(data.get("prompt", ""))
+                    original_sizes.append(data.get("original_size", [0, 0]))
+                    dhdws.append(data.get("dhdw", [0, 0]))
+                    extras_list.append(data.get("extras", None))
+                
+                if not latents:
+                    continue
+                    
+                pixels = torch.stack(latents, dim=0)
+                latent_h, latent_w = pixels.shape[-2:]
+                target_h, target_w = (latent_h * 8, latent_w * 8)
+                bs = len(latents)
+                
+                yield {
+                    "prompts": prompts,
+                    "pixels": pixels,
+                    "is_latent": True,
+                    "target_size_as_tuple": torch.tensor([[target_h, target_w]] * bs),
+                    "original_size_as_tuple": torch.tensor(original_sizes),
+                    "crop_coords_top_left": torch.tensor([[dh * 8, dw * 8] for dh, dw in dhdws]),
+                    "extras": extras_list,
+                }
+            except Exception as e:
+                logger.error(f"Error fetching batch {batch_idx}: {e}")
+                continue
+    
+    def __len__(self):
+        return self._num_batches or 0
+    
+    def close(self):
+        if hasattr(self, '_client') and self._client:
+            self._client.close()
+            self._client = None
+    
+    def __del__(self):
+        self.close()
+
+
+class EmptyLatentDataset(Dataset):
+    """Placeholder dataset for use with SimpleBucketSamplerForHttp.
+    
+    This dataset does nothing - the sampler handles all data fetching.
+    """
+    
+    def __init__(self, size: int = 0):
+        self._size = size
+    
+    def __len__(self):
+        return self._size
+    
+    def __getitem__(self, index):
+        # Should never be called when using SimpleBucketSamplerForHttp
+        raise NotImplementedError("EmptyLatentDataset should not be accessed directly")
+    
+    @staticmethod
+    def passthrough_collate(batch):
+        """Pass through the batch as-is (already collated by sampler)"""
+        # batch is a list containing one already-collated dict from sampler
+        if batch and isinstance(batch[0], dict):
+            return batch[0]
+        return batch
+
+
 class SimpleLatentDataset(Dataset):
     """简单的Latent数据集，用于加载预处理好的latent文件
     

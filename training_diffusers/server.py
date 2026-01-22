@@ -381,6 +381,131 @@ async def reload_dataset(request):
         return json_response({"error": str(e)}, 500)
 
 
+# Global sampling state (per-epoch batch schedule)
+import torch
+_sampling_state = {}  # {(epoch, rank): {"batches": [...], "num_batches": int}}
+
+
+def _compute_batches_for_epoch(epoch: int, batch_size: int, rank: int, num_replicas: int, 
+                                shuffle: bool = True, seed: int = 42, drop_last: bool = False):
+    """Compute batch schedule for a given epoch and rank"""
+    g = torch.Generator()
+    g.manual_seed(seed + epoch)
+    
+    bucket_indices = dataset.bucket_indices
+    
+    all_batches = []
+    for indices in bucket_indices:
+        if len(indices) == 0:
+            continue
+        
+        indices = list(indices)
+        if shuffle:
+            perm = torch.randperm(len(indices), generator=g).tolist()
+            indices = [indices[i] for i in perm]
+        
+        for i in range(0, len(indices), batch_size):
+            batch = indices[i:i + batch_size]
+            if drop_last and len(batch) < batch_size:
+                continue
+            all_batches.append(batch)
+    
+    if shuffle:
+        batch_perm = torch.randperm(len(all_batches), generator=g).tolist()
+        all_batches = [all_batches[i] for i in batch_perm]
+    
+    # Compute total batches
+    total_batches = 0
+    for indices in bucket_indices:
+        if isinstance(indices, int):
+            continue
+        if drop_last:
+            total_batches += len(indices) // batch_size
+        else:
+            total_batches += (len(indices) + batch_size - 1) // batch_size
+    
+    if drop_last:
+        num_batches_per_replica = total_batches // num_replicas
+    else:
+        num_batches_per_replica = (total_batches + num_replicas - 1) // num_replicas
+    
+    total_batches_padded = num_batches_per_replica * num_replicas
+    
+    # Padding
+    if len(all_batches) < total_batches_padded:
+        padding_size = total_batches_padded - len(all_batches)
+        if len(all_batches) > 0:
+            all_batches = all_batches + all_batches[:padding_size]
+        else:
+            all_batches = [[]] * total_batches_padded
+    elif len(all_batches) > total_batches_padded:
+        all_batches = all_batches[:total_batches_padded]
+    
+    # Extract batches for this rank (interleaved)
+    my_batch_indices = list(range(rank, len(all_batches), num_replicas))
+    my_batches = [all_batches[idx] for idx in my_batch_indices]
+    
+    return my_batches, num_batches_per_replica
+
+
+@app.get("/dataset/sample")
+async def dataset_sample(request):
+    """Initialize sampling for an epoch and return num_batches"""
+    if dataset is None:
+         return json_response({"error": "Dataset not loaded"}, 503)
+    
+    try:
+        epoch = int(request.query_params.get("epoch", 0))
+        batch_size = int(request.query_params.get("batch_size", 4))
+        rank = int(request.query_params.get("rank", 0))
+        num_replicas = int(request.query_params.get("num_replicas", 1))
+        
+        batches, num_batches = _compute_batches_for_epoch(epoch, batch_size, rank, num_replicas)
+        
+        # Store in global state
+        _sampling_state[(epoch, rank)] = {
+            "batches": batches,
+            "num_batches": num_batches,
+        }
+        
+        logger.info(f"Initialized sampling: epoch={epoch}, rank={rank}, num_batches={num_batches}")
+        
+        return json_response({"num_batches": num_batches})
+    except Exception as e:
+        logger.error(f"Error in dataset_sample: {e}", exc_info=True)
+        return json_response({"error": str(e)}, 500)
+
+
+@app.get("/dataset/next_batch")
+async def dataset_next_batch(request):
+    """Get a specific batch by index"""
+    if dataset is None:
+         return json_response({"error": "Dataset not loaded"}, 503)
+    
+    try:
+        epoch = int(request.query_params.get("epoch", 0))
+        batch_idx = int(request.query_params.get("batch_idx", 0))
+        rank = int(request.query_params.get("rank", 0))
+        
+        key = (epoch, rank)
+        if key not in _sampling_state:
+            return json_response({"error": f"Epoch {epoch} not initialized for rank {rank}"}, 400)
+        
+        state = _sampling_state[key]
+        if batch_idx >= len(state["batches"]):
+            return json_response({"error": f"batch_idx {batch_idx} out of range"}, 400)
+        
+        indices = state["batches"][batch_idx]
+        if not indices:
+            return json_response([])
+        
+        data = dataset.get_batch_metadata(indices)
+        return json_response(data)
+    except Exception as e:
+        logger.error(f"Error in dataset_next_batch: {e}", exc_info=True)
+        return json_response({"error": str(e)}, 500)
+
+
 @app.post("/config/dropout")
 async def update_dropout_config(request):
     """Update tag dropout configuration"""
