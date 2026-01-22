@@ -374,10 +374,12 @@ def generate_samples(
 ):
     """Generate sample images for validation"""
     from diffusers import EulerDiscreteScheduler
+    import time
     
     if not accelerator.is_main_process:
         return
     
+    start_time = time.time()
     logger.info(f"========== Starting sampling at epoch {epoch}, step {step} ==========")
     unet.eval()
     sampling_cfg = config.sampling
@@ -430,7 +432,8 @@ def generate_samples(
             
             sampling_scheduler.set_timesteps(num_steps, device=device)
             
-            for t in sampling_scheduler.timesteps:
+            # Use tqdm for sampling steps
+            for t in tqdm(sampling_scheduler.timesteps, desc=f"Sampling {idx*num_images+img_idx+1}/{total_images}", leave=False):
                 latent_input = torch.cat([latents] * 2)
                 latent_input = sampling_scheduler.scale_model_input(latent_input, t)
                 
@@ -485,7 +488,8 @@ def generate_samples(
             wandb_tracker.log({"validation_samples": logged_images}, step=step)
             logger.info(f"Logged {len(logged_images)} samples to WandB")
 
-    logger.info(f"========== Sampling complete, {total_images} images saved ==========")
+    elapsed = time.time() - start_time
+    logger.info(f"========== Sampling complete, {total_images} images saved in {elapsed:.2f}s ==========")
     unet.train()
 
 
@@ -566,6 +570,9 @@ def save_checkpoint(
     This implementation follows the approach from modules/sdxl_model.py
     to save weights in a format compatible with ComfyUI/WebUI.
     """
+    import time
+    start_time = time.time()
+    
     cfg = config.trainer
     save_dir = Path(output_dir) / f"checkpoint-e{epoch}_s{step}"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -666,7 +673,8 @@ def save_checkpoint(
             logger.info(f"Saving {num_tensors} tensors to {save_path}...")
             save_file(weight_to_save, str(save_path), metadata=metadata)
             file_size_mb = save_path.stat().st_size / (1024 * 1024)
-            logger.info(f"========== Checkpoint saved successfully ({file_size_mb:.1f} MB) ==========")
+            elapsed = time.time() - start_time
+            logger.info(f"========== Checkpoint saved successfully ({file_size_mb:.1f} MB) in {elapsed:.2f}s ==========")
         except Exception as e:
             logger.warning(f"Failed to save single file: {e}")
     
