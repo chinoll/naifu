@@ -135,7 +135,35 @@ def encode_prompt(
     max_length: int = 77,
 ):
     """Encode prompts using both CLIP text encoders for SDXL"""
-    # Tokenize
+    if max_length <= 77:
+        # Tokenize
+        tokens_1 = tokenizer_1(
+            prompts, padding="max_length", max_length=max_length,
+            truncation=True, return_tensors="pt"
+        ).input_ids.to(device)
+        
+        tokens_2 = tokenizer_2(
+            prompts, padding="max_length", max_length=max_length,
+            truncation=True, return_tensors="pt"
+        ).input_ids.to(device)
+        
+        # Encode with text_encoder_1 (CLIP-ViT-L)
+        with torch.no_grad():
+            encoder_output_1 = text_encoder_1(tokens_1, output_hidden_states=True)
+            hidden_states_1 = encoder_output_1.hidden_states[-2]  # penultimate layer
+        
+        # Encode with text_encoder_2 (CLIP-ViT-bigG)
+        with torch.no_grad():
+            encoder_output_2 = text_encoder_2(tokens_2, output_hidden_states=True)
+            hidden_states_2 = encoder_output_2.hidden_states[-2]
+            pooled_output = encoder_output_2.text_embeds
+        
+        # Concatenate hidden states [batch, seq_len, 768 + 1280]
+        prompt_embeds = torch.cat([hidden_states_1, hidden_states_2], dim=-1)
+        
+        return prompt_embeds, pooled_output
+
+    # Long prompt encoding support
     tokens_1 = tokenizer_1(
         prompts, padding="max_length", max_length=max_length,
         truncation=True, return_tensors="pt"
@@ -145,21 +173,76 @@ def encode_prompt(
         prompts, padding="max_length", max_length=max_length,
         truncation=True, return_tensors="pt"
     ).input_ids.to(device)
+
+    def process_encoder(tokens, encoder, tokenizer):
+        batch_size = tokens.shape[0]
+        chunk_size = 75 # 77 - 2
+        num_chunks = math.ceil((max_length - 2) / chunk_size)
+        
+        # Reshape to list of chunks [batch, 77]
+        input_ids_chunks = []
+        
+        for i in range(num_chunks):
+            start = 1 + i * chunk_size
+            end = min(1 + (i + 1) * chunk_size, max_length - 1)
+            
+            chunk = tokens[:, start:end]
+            
+            # Pad
+            if chunk.shape[1] < chunk_size:
+                pad = torch.full((batch_size, chunk_size - chunk.shape[1]), tokenizer.pad_token_id, device=device, dtype=tokens.dtype)
+                chunk = torch.cat([chunk, pad], dim=1)
+                
+            # Add BOS/EOS
+            bos = torch.full((batch_size, 1), tokenizer.bos_token_id, device=device, dtype=tokens.dtype)
+            eos = torch.full((batch_size, 1), tokenizer.eos_token_id, device=device, dtype=tokens.dtype)
+            
+            chunk_full = torch.cat([bos, chunk, eos], dim=1)
+            input_ids_chunks.append(chunk_full)
+            
+        # Concat chunks -> [batch * num_chunks, 77]
+        input_ids_all = torch.cat(input_ids_chunks, dim=0)
+        
+        with torch.no_grad():
+            output = encoder(input_ids_all, output_hidden_states=True)
+            
+        if hasattr(output, "text_embeds"):
+            # TE2
+            hidden_states = output.hidden_states[-2]
+            pooled = output.text_embeds
+        else:
+            # TE1
+            hidden_states = output.hidden_states[-2]
+            pooled = None
+            
+        # Unpack hidden states [batch * num_chunks, 77, dim] -> [num_chunks, batch, 77, dim]
+        hidden_states = hidden_states.view(num_chunks, batch_size, 77, -1)
+        
+        states_list = []
+        # BOS
+        states_list.append(hidden_states[0, :, 0:1, :])
+        
+        for i in range(num_chunks):
+            states_list.append(hidden_states[i, :, 1:76, :]) # Take 75 tokens
+            
+        states = torch.cat(states_list, dim=1) # [batch, 1 + num_chunks * 75, dim]
+        
+        # Truncate to max_length
+        if states.shape[1] > max_length:
+            states = states[:, :max_length, :]
+            
+        # Handle pooled
+        if pooled is not None:
+             # Pooled is [batch * num_chunks, dim] -> [num_chunks, batch, dim]
+             pooled = pooled.view(num_chunks, batch_size, -1)
+             pooled = pooled[0] # Use first chunk for pooled representation
+             
+        return states, pooled
+
+    hidden_states_1, _ = process_encoder(tokens_1, text_encoder_1, tokenizer_1)
+    hidden_states_2, pooled_output = process_encoder(tokens_2, text_encoder_2, tokenizer_2)
     
-    # Encode with text_encoder_1 (CLIP-ViT-L)
-    with torch.no_grad():
-        encoder_output_1 = text_encoder_1(tokens_1, output_hidden_states=True)
-        hidden_states_1 = encoder_output_1.hidden_states[-2]  # penultimate layer
-    
-    # Encode with text_encoder_2 (CLIP-ViT-bigG)
-    with torch.no_grad():
-        encoder_output_2 = text_encoder_2(tokens_2, output_hidden_states=True)
-        hidden_states_2 = encoder_output_2.hidden_states[-2]
-        pooled_output = encoder_output_2.text_embeds
-    
-    # Concatenate hidden states [batch, seq_len, 768 + 1280]
     prompt_embeds = torch.cat([hidden_states_1, hidden_states_2], dim=-1)
-    
     return prompt_embeds, pooled_output
 
 
@@ -287,7 +370,7 @@ def training_step(
 @torch.inference_mode()
 def generate_samples(
     unet, vae, text_encoder_1, text_encoder_2, tokenizer_1, tokenizer_2, noise_scheduler,
-    prompts, config, accelerator, epoch, step, save_dir,
+    prompts, config, accelerator, epoch, step, save_dir, max_length=77,
 ):
     """Generate sample images for validation"""
     from diffusers import EulerDiscreteScheduler
@@ -318,6 +401,7 @@ def generate_samples(
             tokenizer_1, tokenizer_2,
             text_encoder_1, text_encoder_2,
             device=device,
+            max_length=max_length,
         )
         prompt_embeds = prompt_embeds.to(dtype)
         pooled_embeds = pooled_embeds.to(dtype)
@@ -371,6 +455,7 @@ def generate_samples(
 
 def save_checkpoint(
     unet, text_encoder_1, text_encoder_2, vae,
+    tokenizer_1, tokenizer_2, noise_scheduler,
     accelerator, config, epoch, step, output_dir,
 ):
     """Save checkpoint in Diffusers format"""
@@ -404,6 +489,23 @@ def save_checkpoint(
     save_file({}, save_dir / "metadata.safetensors", metadata=metadata)
     
     logger.info(f"Saved checkpoint to {save_dir}")
+
+    # Save single file
+    try:
+        pipeline = StableDiffusionXLPipeline(
+            vae=accelerator.unwrap_model(vae),
+            text_encoder=accelerator.unwrap_model(text_encoder_1),
+            text_encoder_2=accelerator.unwrap_model(text_encoder_2),
+            tokenizer=tokenizer_1,
+            tokenizer_2=tokenizer_2,
+            unet=unwrapped_unet,
+            scheduler=noise_scheduler,
+        )
+        pipeline.save_single_file(save_dir / "model.safetensors")
+        logger.info(f"Saved single file checkpoint to {save_dir}/model.safetensors")
+    except Exception as e:
+        logger.warning(f"Failed to save single file: {e}")
+
     accelerator.wait_for_everyone()
 
 
@@ -598,7 +700,7 @@ def main():
 
                 # Checkpoint by steps
                 if cfg.get("checkpoint_steps", -1) > 0 and global_step % cfg.checkpoint_steps == 0:
-                    save_checkpoint(unet, te1, te2, vae, accelerator, config, epoch, global_step, cfg.checkpoint_dir)
+                    save_checkpoint(unet, te1, te2, vae, tok1, tok2, scheduler, accelerator, config, epoch, global_step, cfg.checkpoint_dir)
                 
                 # Sampling by steps
                 sampling_cfg = config.get("sampling", {})
@@ -608,12 +710,13 @@ def main():
                             unet, vae, te1, te2, tok1, tok2, scheduler,
                             sampling_cfg.prompts, config, accelerator, epoch, global_step,
                             sampling_cfg.get("save_dir", "samples"),
+                            max_length=config.dataset.get("max_token_length", 77),
                         )
         
         # End of epoch
         # Checkpoint by epochs
         if cfg.get("checkpoint_freq", -1) > 0 and (epoch + 1) % cfg.checkpoint_freq == 0:
-            save_checkpoint(unet, te1, te2, vae, accelerator, config, epoch, global_step, cfg.checkpoint_dir)
+            save_checkpoint(unet, te1, te2, vae, tok1, tok2, scheduler, accelerator, config, epoch, global_step, cfg.checkpoint_dir)
         
         # Sampling by epochs  
         if sampling_cfg.get("enabled") and sampling_cfg.get("every_n_epochs", -1) > 0:
@@ -622,6 +725,7 @@ def main():
                     unet, vae, te1, te2, tok1, tok2, scheduler,
                     sampling_cfg.prompts, config, accelerator, epoch, global_step,
                     sampling_cfg.get("save_dir", "samples"),
+                    max_length=config.dataset.get("max_token_length", 77),
                 )
     
     accelerator.end_training()
