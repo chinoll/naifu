@@ -619,7 +619,7 @@ class SimpleLatentDatasetForHttp(Dataset):
         num_workers: int = 4,
         shuffle: bool = True,
         drop_last: bool = False,
-        timeout: float = 30.0,
+        timeout: float = 120.0,
         max_connections: int = 100,
         http2: bool = True,
         prefetch_batch_size: int = 64,
@@ -708,6 +708,12 @@ class SimpleLatentDatasetForHttp(Dataset):
         """Fetch batch data from server"""
         client = self._get_client()
         
+        # Ensure indices are JSON serializable (integers)
+        if hasattr(indices, "tolist"):
+             indices = indices.tolist()
+        else:
+             indices = [int(i) for i in indices]
+        
         response = client.post(
             "/dataset/batch",
             content=self._json_dumps({"indices": indices}),
@@ -721,6 +727,8 @@ class SimpleLatentDatasetForHttp(Dataset):
         return self._size
     
     def __getitem__(self, index):
+        return index
+        print("index",index)
         """Get single item (fallback, inefficient)"""
         data = self._fetch_batch([index])[0]
         
@@ -737,6 +745,7 @@ class SimpleLatentDatasetForHttp(Dataset):
     def batch_collate_fn(self, batch_indices: list):
         """Optimized collate function that fetches data in batch"""
         # Fetch batch data
+        #print(batch_indices)
         batch_data = self._fetch_batch(batch_indices)
         
         latents = []
@@ -810,3 +819,4 @@ class SimpleLatentDatasetForHttp(Dataset):
     
     def __del__(self):
         self.close()
+

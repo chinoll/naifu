@@ -37,6 +37,7 @@ from diffusers import (
     StableDiffusionXLPipeline,
 )
 from diffusers.utils import convert_unet_state_dict_to_peft
+from accelerate.state import AcceleratorState
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, AutoTokenizer
 from safetensors.torch import load_file, save_file
 
@@ -199,7 +200,7 @@ def training_step(
         with torch.no_grad():
             latents = vae.encode(batch["pixels"].to(vae.dtype)).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
-    
+    bsz = latents.shape[0]
     # Encode prompts
     prompt_embeds, pooled_embeds = encode_prompt(
         batch["prompts"],
@@ -431,8 +432,8 @@ def main():
         log_with="wandb" if cfg.get("wandb_id") else None,
         project_config=project_config,
     )
-    
     # Logging
+    AcceleratorState().deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.trainer.batch_size
     if accelerator.is_main_process:
         if cfg.get("wandb_id"):
             accelerator.init_trackers(project_name=cfg.wandb_id, config=OmegaConf.to_container(config))
@@ -488,6 +489,8 @@ def main():
             **config.dataset,
         )
     dataloader = dataset.init_dataloader()
+    print("dataloader length",len(dataloader))
+    print(len(dataloader))
     
     # Optimizer - support torch.optim, bitsandbytes, etc.
     trainable_params = list(unet.parameters())
@@ -529,7 +532,8 @@ def main():
         )
     
     # Prepare with Accelerate
-    unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
+    # no accelerator.prepare dataloader
+    unet, optimizer = accelerator.prepare(unet, optimizer)
     if config.advanced.get("train_text_encoder_1", False):
         te1 = accelerator.prepare(te1)
     if config.advanced.get("train_text_encoder_2", False):
@@ -556,11 +560,14 @@ def main():
     logger.info(f"  Gradient accumulation steps = {cfg.get('accumulate_grad_batches', 1)}")
     
     progress_bar = tqdm(range(cfg.max_epochs * len(dataloader)), disable=not accelerator.is_main_process)
-    
+    grad_norm = None
     for epoch in range(start_epoch, cfg.max_epochs):
         unet.train()
         
         for batch in dataloader:
+            for key in batch.keys():
+                if type(batch[key]) == torch.Tensor:
+                    batch[key] = batch[key].to(unet.device)
             with accelerator.accumulate(unet):
                 loss = training_step(
                     batch, unet, vae, te1, te2, tok1, tok2, scheduler,
@@ -570,7 +577,7 @@ def main():
                 
                 if accelerator.sync_gradients:
                     if cfg.get("gradient_clip_val", 0) > 0:
-                        accelerator.clip_grad_norm_(unet.parameters(), cfg.gradient_clip_val)
+                        grad_norm = accelerator.clip_grad_norm_(unet.parameters(), cfg.gradient_clip_val)
                 
                 optimizer.step()
                 if lr_scheduler:
@@ -584,8 +591,11 @@ def main():
                 
                 # Logging
                 if accelerator.is_main_process:
-                    accelerator.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]}, step=global_step)
-                
+                    if grad_norm is None:
+                        accelerator.log({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]}, step=global_step)
+                    else:
+                        accelerator.log({"loss":loss.item(),"lr":optimizer.param_groups[0]["lr"],"grad_norm":grad_norm},step=global_step)
+
                 # Checkpoint by steps
                 if cfg.get("checkpoint_steps", -1) > 0 and global_step % cfg.checkpoint_steps == 0:
                     save_checkpoint(unet, te1, te2, vae, accelerator, config, epoch, global_step, cfg.checkpoint_dir)

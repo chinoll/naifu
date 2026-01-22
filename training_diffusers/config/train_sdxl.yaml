@@ -10,9 +10,9 @@ trainer:
   # Model path: can be HuggingFace Hub ID or local path
   # - HF format: "stabilityai/stable-diffusion-xl-base-1.0" or "/path/to/diffusers_model/"
   # - Single file: "/path/to/model.safetensors" or "/path/to/model.ckpt"
-  model_path: stabilityai/stable-diffusion-xl-base-1.0
+  model_path: "/home/zetyun/naifu/checkpoint/checkpoint-e0_s20000.safetensors"
   
-  batch_size: 4
+  batch_size: 64
   seed: 42
   wandb_id: ""  # Set to enable W&B logging
   
@@ -26,7 +26,7 @@ trainer:
   checkpoint_steps: -1      # Save every N steps (-1 to disable)
   
   # Training duration
-  max_epochs: 10
+  max_epochs: 1
   max_steps: -1             # -1 = no limit
 
 # Accelerate settings (used by Accelerator)
@@ -41,7 +41,7 @@ advanced:
   text_encoder_2_lr: 1e-6
   
   gradient_checkpointing: true
-  use_xformers: false          # Enable xformers memory efficient attention
+  use_xformers: true          # Enable xformers memory efficient attention
   
   # CFG training (condition dropout)
   condition_dropout_rate: 0.1  # 0.0 to disable, 0.1 = 10% unconditional
@@ -66,8 +66,8 @@ advanced:
 
 # Dataset (SimpleLatentDataset)
 dataset:
-  data_root: /path/to/latent_data  # Contains latents/ folder and metadata.jsonl
-  max_token_length: 77
+  server_url: http://localhost:8000/
+  max_token_length: 225
   seed: 42
   num_workers: 4
   shuffle: true
@@ -77,12 +77,11 @@ dataset:
 # Optimizer
 # Supported: torch.optim.*, bitsandbytes.optim.*
 optimizer:
-  name: torch.optim.AdamW
+  name: bitsandbytes.optim.AdamW8bit #torch.optim.AdamW
   params:
     lr: 1e-5
     betas: [0.9, 0.999]
     weight_decay: 0.01
-    eps: 1e-8
 
 # Alternative: 8-bit AdamW (saves ~50% optimizer memory)
 # optimizer:

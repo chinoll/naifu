@@ -18,11 +18,13 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any
 
-from robyn import Robyn
+from robyn import Robyn, Request, Response
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+handler = logging.StreamHandler(sys.stdout)
 logger = logging.getLogger(__name__)
+logger.addHandler(handler)
 
 app = Robyn(__file__)
 
@@ -42,11 +44,11 @@ if os.environ.get("SDXL_DATA_ROOT"):
 
 def json_response(data, status_code=200):
     """Helper to return high-performance JSON response using orjson"""
-    return {
-        "body": orjson.dumps(data),
-        "headers": {"Content-Type": "application/json"},
-        "status_code": status_code
-    }
+    return Response(
+        status_code=status_code,
+        headers={"Content-Type": "application/json"},
+        description=orjson.dumps(data)
+    )
 
 
 class ServerDataset:
@@ -122,13 +124,14 @@ class ServerDataset:
         start_time = time.time()
         
         # 1. Scan buckets
-        latents_dir = os.path.join(self.data_root, "latents")
+        latents_dir = os.path.join(self.data_root)#, "latents")
         if not os.path.exists(latents_dir):
              raise FileNotFoundError(f"Latents dir not found: {latents_dir}")
 
+        from tqdm import tqdm
         self.buckets = {
             k: self._dirwalk(os.path.join(latents_dir, k)) 
-            for k in os.listdir(latents_dir)
+            for k in tqdm(os.listdir(latents_dir))
             if os.path.isdir(os.path.join(latents_dir, k))
         }
         
@@ -138,7 +141,7 @@ class ServerDataset:
             jsonl_path = os.path.join(self.data_root, "metadata.jsonl")
             if os.path.exists(jsonl_path):
                 with open(jsonl_path, 'r', encoding='utf-8') as f:
-                    for line in f:
+                    for line in tqdm(f):
                         line = line.strip()
                         if line:
                             record = json.loads(line)
@@ -151,7 +154,7 @@ class ServerDataset:
         self.files = []
         self.bucket_indices = []
         
-        for resolution, files in self.buckets.items():
+        for resolution, files in tqdm(self.buckets.items()):
             bucket_valid_indices = []
             for filepath in files:
                 key = Path(filepath).stem
@@ -161,9 +164,9 @@ class ServerDataset:
                 if not self.debug and key in self.metadata:
                     meta = self.metadata[key]
                     meta_dict = meta.get('metadata', meta) if isinstance(meta.get('metadata'), dict) else meta
-                    for field_key, value in meta_dict.items():
-                        if field_key.endswith('_repeat') and isinstance(value, (int, float)):
-                            repeat_count = max(repeat_count, int(value))
+                    #for field_key, value in meta_dict.items():
+                    #    if field_key.endswith('_repeat') and isinstance(value, (int, float)):
+                    #        repeat_count = max(repeat_count, int(value))
                 
                 # Only add if we have metadata or if debugging
                 if self.debug or key in self.metadata:
