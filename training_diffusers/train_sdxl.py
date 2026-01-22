@@ -695,17 +695,25 @@ def main():
     config = OmegaConf.load(args.config)
     cfg = config.trainer
     
+    
     # Accelerator setup
     project_config = ProjectConfiguration(
         project_dir=cfg.checkpoint_dir,
         logging_dir=cfg.get("logging_dir", "logs"),
     )
     
+    from accelerate.utils import InitProcessGroupKwargs
+    from datetime import timedelta
+    
+    nccl_timeout = config.get("accelerate", {}).get("nccl_timeout", 1800)
+    kwargs_handlers = [InitProcessGroupKwargs(timeout=timedelta(seconds=nccl_timeout))]
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.get("accumulate_grad_batches", 1),
         mixed_precision=config.get("accelerate", {}).get("mixed_precision", "bf16"),
         log_with="wandb" if cfg.get("wandb_id") else None,
         project_config=project_config,
+        kwargs_handlers=kwargs_handlers,
     )
 
     # Configure logging
@@ -885,7 +893,10 @@ def main():
             if accelerator.sync_gradients:
                 global_step += 1
                 progress_bar.update(1)
-                progress_bar.set_postfix(loss=loss.item(), epoch=epoch, step=global_step)
+                if grad_norm is None:
+                    progress_bar.set_postfix(loss=loss.item(),lr=optimizer.param_groups[0]["lr"], epoch=epoch, step=global_step)
+                else:
+                    progress_bar.set_postfix(loss=loss.item(),lr=optimizer.param_groups[0]["lr"], grad_norm=grad_norm, epoch=epoch, step=global_step)
                 
                 # Logging
                 if accelerator.is_main_process:
