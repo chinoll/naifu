@@ -436,7 +436,7 @@ def generate_samples(
         # Decode
         latents = latents / vae.config.scaling_factor
         with torch.autocast(device.type, enabled=False):
-            image = vae.decode(latents.float(), return_dict=False)[0]
+            image = vae.decode(latents, return_dict=False)[0]
         
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
@@ -475,10 +475,10 @@ def save_checkpoint(
                 vae=accelerator.unwrap_model(vae),
                 text_encoder=accelerator.unwrap_model(text_encoder_1),
                 text_encoder_2=accelerator.unwrap_model(text_encoder_2),
-                # tokenizer=tokenizer_1,
-                # tokenizer_2=tokenizer_2,
+                tokenizer=None,
+                tokenizer_2=None,
                 unet=unwrapped_unet,
-                # scheduler=noise_scheduler,
+                scheduler=None,
             )
             pipeline.save_single_file(save_dir / "model.safetensors")
             logger.info(f"Saved checkpoint and single-file to {save_dir}")
