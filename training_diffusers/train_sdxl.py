@@ -426,11 +426,11 @@ def generate_samples(
             add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=device, dtype=dtype)
             add_time_ids = add_time_ids.repeat(2, 1)
             
+            sampling_scheduler.set_timesteps(num_steps, device=device)
+
             # Initial latents
             latents = torch.randn((1, 4, height // 8, width // 8), generator=generator, device="cpu")
             latents = latents.to(device=device, dtype=dtype) * sampling_scheduler.init_noise_sigma
-            
-            sampling_scheduler.set_timesteps(num_steps, device=device)
             
             # Use tqdm for sampling steps
             for t in tqdm(sampling_scheduler.timesteps, desc=f"Sampling {idx*num_images+img_idx+1}/{total_images}", leave=False):
