@@ -413,7 +413,7 @@ def generate_samples(
         for img_idx in range(num_images):
             # Encode prompt with configurable negative prompt
             prompt_embeds, pooled_embeds = encode_prompt(
-                [prompt, negative_prompt],  # prompt + negative
+                [negative_prompt, prompt],  # negative + prompt (correct order for CFG)
                 tokenizer_1, tokenizer_2,
                 text_encoder_1, text_encoder_2,
                 device=device,
@@ -695,7 +695,6 @@ def main():
     config = OmegaConf.load(args.config)
     cfg = config.trainer
     
-    
     # Accelerator setup
     project_config = ProjectConfiguration(
         project_dir=cfg.checkpoint_dir,
@@ -795,8 +794,6 @@ def main():
             **config.dataset,
         )
     dataloader = dataset.init_dataloader()
-    print("dataloader length",len(dataloader))
-    print(len(dataloader))
     
     # Optimizer - support torch.optim, bitsandbytes, etc.
     trainable_params = list(unet.parameters())
