@@ -378,6 +378,7 @@ def generate_samples(
     if not accelerator.is_main_process:
         return
     
+    logger.info(f"========== Starting sampling at epoch {epoch}, step {step} ==========")
     unet.eval()
     sampling_cfg = config.sampling
     device = accelerator.device
@@ -391,61 +392,100 @@ def generate_samples(
     num_steps = sampling_cfg.get("steps", 25)
     guidance_scale = sampling_cfg.get("guidance_scale", 7.0)
     
+    logger.info(f"Sampling config: {height}x{width}, {num_steps} steps, CFG={guidance_scale}")
+
+    # Get num_images and negative_prompt from config
+    num_images = sampling_cfg.get("num_images", 1)
+    negative_prompt = sampling_cfg.get("negative_prompt", "lowres, low quality, text, error, extra digit, cropped")
+    total_images = len(prompts) * num_images
+    logger.info(f"Generating {total_images} sample(s) ({len(prompts)} prompts x {num_images} images each)...")
+    logger.info(f"Negative prompt: {negative_prompt[:50]}..." if len(negative_prompt) > 50 else f"Negative prompt: {negative_prompt}")
+
     generator = torch.Generator(device="cpu").manual_seed(sampling_cfg.get("seed", 42))
     os.makedirs(save_dir, exist_ok=True)
     
+    image_count = 0
+    wandb_images = []
+
     for idx, prompt in enumerate(prompts):
-        # Encode prompt
-        prompt_embeds, pooled_embeds = encode_prompt(
-            [prompt, ""],  # prompt + negative
-            tokenizer_1, tokenizer_2,
-            text_encoder_1, text_encoder_2,
-            device=device,
-            max_length=max_length,
-        )
-        prompt_embeds = prompt_embeds.to(dtype)
-        pooled_embeds = pooled_embeds.to(dtype)
-        
-        # Time IDs
-        add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=device, dtype=dtype)
-        add_time_ids = add_time_ids.repeat(2, 1)
-        
-        # Initial latents
-        latents = torch.randn((1, 4, height // 8, width // 8), generator=generator, device="cpu")
-        latents = latents.to(device=device, dtype=dtype) * sampling_scheduler.init_noise_sigma
-        
-        sampling_scheduler.set_timesteps(num_steps, device=device)
-        
-        for t in sampling_scheduler.timesteps:
-            latent_input = torch.cat([latents] * 2)
-            latent_input = sampling_scheduler.scale_model_input(latent_input, t)
+        for img_idx in range(num_images):
+            # Encode prompt with configurable negative prompt
+            prompt_embeds, pooled_embeds = encode_prompt(
+                [prompt, negative_prompt],  # prompt + negative
+                tokenizer_1, tokenizer_2,
+                text_encoder_1, text_encoder_2,
+                device=device,
+                max_length=max_length,
+            )
+            prompt_embeds = prompt_embeds.to(dtype)
+            pooled_embeds = pooled_embeds.to(dtype)
             
-            noise_pred = unet(
-                latent_input,
-                t,
-                encoder_hidden_states=prompt_embeds,
-                added_cond_kwargs={"text_embeds": pooled_embeds, "time_ids": add_time_ids},
-                return_dict=False,
-            )[0]
+            # Time IDs
+            add_time_ids = torch.tensor([[height, width, 0, 0, height, width]], device=device, dtype=dtype)
+            add_time_ids = add_time_ids.repeat(2, 1)
             
-            noise_uncond, noise_text = noise_pred.chunk(2)
-            noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+            # Initial latents
+            latents = torch.randn((1, 4, height // 8, width // 8), generator=generator, device="cpu")
+            latents = latents.to(device=device, dtype=dtype) * sampling_scheduler.init_noise_sigma
             
-            latents = sampling_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        
-        # Decode
-        latents = latents / vae.config.scaling_factor
-        with torch.autocast(device.type, enabled=False):
-            image = vae.decode(latents, return_dict=False)[0]
-        
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-        image = (image * 255).round().astype("uint8")[0]
-        
-        from PIL import Image
-        Image.fromarray(image).save(f"{save_dir}/sample_e{epoch}_s{step}_{idx}.png")
-        logger.info(f"Saved sample: {save_dir}/sample_e{epoch}_s{step}_{idx}.png")
+            sampling_scheduler.set_timesteps(num_steps, device=device)
+            
+            for t in sampling_scheduler.timesteps:
+                latent_input = torch.cat([latents] * 2)
+                latent_input = sampling_scheduler.scale_model_input(latent_input, t)
+                
+                noise_pred = unet(
+                    latent_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    added_cond_kwargs={"text_embeds": pooled_embeds, "time_ids": add_time_ids},
+                    return_dict=False,
+                )[0]
+                
+                noise_uncond, noise_text = noise_pred.chunk(2)
+                noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+                
+                latents = sampling_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            
+            # Decode
+            latents = latents / vae.config.scaling_factor
+            with torch.autocast(device.type, enabled=False):
+                image = vae.decode(latents, return_dict=False)[0]
+            
+            image = (image / 2 + 0.5).clamp(0, 1)
+            image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+            image = (image * 255).round().astype("uint8")[0]
+            
+            from PIL import Image
+            pil_image = Image.fromarray(image)
+            
+            if num_images > 1:
+                save_name = f"sample_e{epoch}_s{step}_p{idx}_n{img_idx}.png"
+            else:
+                save_name = f"sample_e{epoch}_s{step}_{idx}.png"
+                
+            save_path = f"{save_dir}/{save_name}"
+            pil_image.save(save_path)
+            image_count += 1
+            logger.info(f"[{image_count}/{total_images}] Saved: {save_path}")
+
+            # Collect for WandB
+            if accelerator.is_main_process:
+                wandb_images.append(
+                    {"image": pil_image, "caption": f"{prompt[:50]}..."}
+                )
     
+    # Log to WandB
+    if accelerator.is_main_process and wandb_images:
+        wandb_tracker = accelerator.get_tracker("wandb")
+        if wandb_tracker:
+            import wandb
+            # Convert to wandb.Image objects
+            logged_images = [wandb.Image(item["image"], caption=item["caption"]) for item in wandb_images]
+            wandb_tracker.log({"validation_samples": logged_images}, step=step)
+            logger.info(f"Logged {len(logged_images)} samples to WandB")
+
+    logger.info(f"========== Sampling complete, {total_images} images saved ==========")
     unet.train()
 
 
@@ -529,8 +569,14 @@ def save_checkpoint(
     cfg = config.trainer
     save_dir = Path(output_dir) / f"checkpoint-e{epoch}_s{step}"
     save_dir.mkdir(parents=True, exist_ok=True)
+    
+    if accelerator.is_main_process:
+        logger.info(f"========== Saving checkpoint at epoch {epoch}, step {step} ==========")
+        logger.info(f"Checkpoint directory: {save_dir}")
 
     # 1. Save Accelerate State (Optimizer, LR Scheduler, etc.) - Must be called by ALL processes
+    if accelerator.is_main_process:
+        logger.info("Saving accelerator state (optimizer, scheduler)...")
     accelerator.save_state(save_dir)
 
     # 2. Gather and save single file (main process only for final save)
@@ -540,7 +586,12 @@ def save_checkpoint(
     if hasattr(accelerator.state, "deepspeed_plugin") and accelerator.state.deepspeed_plugin is not None:
         from deepspeed import zero
         
+        if accelerator.is_main_process:
+            logger.info("Using DeepSpeed: gathering distributed weights...")
+        
         # Gather UNet weights from DeepSpeed
+        if accelerator.is_main_process:
+            logger.info("Gathering UNet weights...")
         unwrapped_unet = accelerator.unwrap_model(unet)
         with zero.GatheredParameters(unwrapped_unet.parameters()):
             unet_state_dict = unwrapped_unet.state_dict()
@@ -548,6 +599,8 @@ def save_checkpoint(
                 weight_to_save[f"model.diffusion_model.{key}"] = value.cpu().clone()
         
         # Gather Text Encoder 1 if trained
+        if accelerator.is_main_process:
+            logger.info("Gathering Text Encoder 1 weights...")
         if config.advanced.get("train_text_encoder_1", False):
             unwrapped_te1 = accelerator.unwrap_model(text_encoder_1)
             with zero.GatheredParameters(unwrapped_te1.parameters()):
@@ -560,6 +613,8 @@ def save_checkpoint(
                 weight_to_save[f"conditioner.embedders.0.transformer.{key}"] = value.cpu().clone()
         
         # Gather Text Encoder 2 if trained
+        if accelerator.is_main_process:
+            logger.info("Gathering Text Encoder 2 weights...")
         if config.advanced.get("train_text_encoder_2", False):
             unwrapped_te2 = accelerator.unwrap_model(text_encoder_2)
             with zero.GatheredParameters(unwrapped_te2.parameters()):
@@ -573,6 +628,8 @@ def save_checkpoint(
                 
     else:
         # Non-DeepSpeed: simple unwrap
+        if accelerator.is_main_process:
+            logger.info("Collecting model weights...")
         unwrapped_unet = accelerator.unwrap_model(unet)
         unet_state_dict = unwrapped_unet.state_dict()
         for key, value in unet_state_dict.items():
@@ -590,6 +647,8 @@ def save_checkpoint(
             weight_to_save[f"conditioner.embedders.1.model.{key}"] = value.cpu().clone()
     
     # VAE is always frozen, no need for distributed gathering
+    if accelerator.is_main_process:
+        logger.info("Collecting VAE weights...")
     vae_state_dict = vae.state_dict()
     for key, value in vae_state_dict.items():
         weight_to_save[f"first_stage_model.{key}"] = value.cpu().clone()
@@ -603,8 +662,11 @@ def save_checkpoint(
             "format": "sdxl_sgm",
         }
         try:
+            num_tensors = len(weight_to_save)
+            logger.info(f"Saving {num_tensors} tensors to {save_path}...")
             save_file(weight_to_save, str(save_path), metadata=metadata)
-            logger.info(f"Saved single-file checkpoint to {save_path}")
+            file_size_mb = save_path.stat().st_size / (1024 * 1024)
+            logger.info(f"========== Checkpoint saved successfully ({file_size_mb:.1f} MB) ==========")
         except Exception as e:
             logger.warning(f"Failed to save single file: {e}")
     
