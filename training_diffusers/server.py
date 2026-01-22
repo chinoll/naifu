@@ -21,10 +21,14 @@ from typing import List, Dict, Any
 from robyn import Robyn, Request, Response
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-handler = logging.StreamHandler(sys.stdout)
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True
+)
 logger = logging.getLogger(__name__)
-logger.addHandler(handler)
 
 app = Robyn(__file__)
 
