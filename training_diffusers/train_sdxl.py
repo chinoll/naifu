@@ -458,54 +458,57 @@ def save_checkpoint(
     tokenizer_1, tokenizer_2, noise_scheduler,
     accelerator, config, epoch, step, output_dir,
 ):
-    """Save checkpoint in Diffusers format"""
-    if not accelerator.is_main_process:
-        accelerator.wait_for_everyone()
-        return
+    """Save checkpoint in Diffusers format + Accelerate State + Single File"""
     
     save_dir = Path(output_dir) / f"checkpoint-e{epoch}_s{step}"
     save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Unwrap models
-    unwrapped_unet = accelerator.unwrap_model(unet)
-    
-    # Save UNet
-    unwrapped_unet.save_pretrained(save_dir / "unet")
-    
-    # Save text encoders if trained
-    if config.advanced.get("train_text_encoder_1", False):
-        unwrapped_te1 = accelerator.unwrap_model(text_encoder_1)
-        unwrapped_te1.save_pretrained(save_dir / "text_encoder")
-    
-    if config.advanced.get("train_text_encoder_2", False):
-        unwrapped_te2 = accelerator.unwrap_model(text_encoder_2)
-        unwrapped_te2.save_pretrained(save_dir / "text_encoder_2")
-    
-    # Save VAE (always frozen, just copy config)
-    vae.save_pretrained(save_dir / "vae")
-    
-    # Save metadata
-    metadata = {"epoch": str(epoch), "global_step": str(step)}
-    save_file({}, save_dir / "metadata.safetensors", metadata=metadata)
-    
-    logger.info(f"Saved checkpoint to {save_dir}")
 
-    # Save single file
-    try:
-        pipeline = StableDiffusionXLPipeline(
-            vae=accelerator.unwrap_model(vae),
-            text_encoder=accelerator.unwrap_model(text_encoder_1),
-            text_encoder_2=accelerator.unwrap_model(text_encoder_2),
-            tokenizer=tokenizer_1,
-            tokenizer_2=tokenizer_2,
-            unet=unwrapped_unet,
-            scheduler=noise_scheduler,
-        )
-        pipeline.save_single_file(save_dir / "model.safetensors")
-        logger.info(f"Saved single file checkpoint to {save_dir}/model.safetensors")
-    except Exception as e:
-        logger.warning(f"Failed to save single file: {e}")
+    # 1. Save Accelerate State (Optimizer, LR Scheduler, etc.) - Must be called by ALL processes
+    accelerator.save_state(save_dir)
+    
+    # 2. Main Process Only: Save Model Weights (Diffusers format & Single File)
+    if accelerator.is_main_process:
+        # Unwrap models
+        unwrapped_unet = accelerator.unwrap_model(unet)
+        
+        # Save UNet
+        unwrapped_unet.save_pretrained(save_dir / "unet")
+        
+        # Save text encoders if trained
+        if config.advanced.get("train_text_encoder_1", False):
+            unwrapped_te1 = accelerator.unwrap_model(text_encoder_1)
+            unwrapped_te1.save_pretrained(save_dir / "text_encoder")
+        
+        if config.advanced.get("train_text_encoder_2", False):
+            unwrapped_te2 = accelerator.unwrap_model(text_encoder_2)
+            unwrapped_te2.save_pretrained(save_dir / "text_encoder_2")
+        
+        # Save VAE (always frozen, just copy config)
+        vae.save_pretrained(save_dir / "vae")
+        
+        # Save metadata
+        metadata = {"epoch": str(epoch), "global_step": str(step)}
+        save_file({}, save_dir / "metadata.safetensors", metadata=metadata)
+        
+        logger.info(f"Saved checkpoint to {save_dir}")
 
+        # Save single file
+        try:
+            pipeline = StableDiffusionXLPipeline(
+                vae=accelerator.unwrap_model(vae),
+                text_encoder=accelerator.unwrap_model(text_encoder_1),
+                text_encoder_2=accelerator.unwrap_model(text_encoder_2),
+                tokenizer=tokenizer_1,
+                tokenizer_2=tokenizer_2,
+                unet=unwrapped_unet,
+                scheduler=noise_scheduler,
+            )
+            pipeline.save_single_file(save_dir / "model.safetensors")
+            logger.info(f"Saved single file checkpoint to {save_dir}/model.safetensors")
+        except Exception as e:
+            logger.warning(f"Failed to save single file: {e}")
+
+    # Ensure all processes wait for saving to complete
     accelerator.wait_for_everyone()
 
 
