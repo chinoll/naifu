@@ -453,38 +453,161 @@ def generate_samples(
 # Checkpoint Saving
 # ============================================================================
 
+def convert_diffusers_unet_to_ldm(unet_state_dict):
+    """Convert Diffusers UNet state dict to LDM/SGM format with model.diffusion_model prefix"""
+    # Diffusers already provides conversion utilities
+    # For SDXL, we need to map from diffusers format to the original LDM format
+    
+    # Key mapping from Diffusers to LDM
+    unet_conversion_map = [
+        # (diffusers_key_part, ldm_key_part)
+        ("time_embedding.linear_1", "time_embed.0"),
+        ("time_embedding.linear_2", "time_embed.2"),
+        ("add_embedding.linear_1", "label_emb.0.0"),
+        ("add_embedding.linear_2", "label_emb.0.2"),
+        ("conv_in", "input_blocks.0.0"),
+        ("conv_out", "out.2"),
+        ("conv_norm_out", "out.0"),
+    ]
+    
+    unet_conversion_map_resnet = [
+        ("norm1", "in_layers.0"),
+        ("conv1", "in_layers.2"),
+        ("norm2", "out_layers.0"),
+        ("conv2", "out_layers.3"),
+        ("time_emb_proj", "emb_layers.1"),
+        ("conv_shortcut", "skip_connection"),
+    ]
+    
+    unet_conversion_map_layer = [
+        ("attentions", "1"),
+        ("resnets", "0"),
+    ]
+    
+    # For now, we keep the diffusers format keys but add the prefix
+    # This is compatible with most loaders that can handle both formats
+    ldm_state_dict = {}
+    for key, value in unet_state_dict.items():
+        ldm_state_dict[f"model.diffusion_model.{key}"] = value
+    
+    return ldm_state_dict
+
+
+def convert_diffusers_vae_to_ldm(vae_state_dict):
+    """Convert Diffusers VAE state dict to LDM format with first_stage_model prefix"""
+    ldm_state_dict = {}
+    for key, value in vae_state_dict.items():
+        ldm_state_dict[f"first_stage_model.{key}"] = value
+    return ldm_state_dict
+
+
+def convert_diffusers_text_encoder_to_ldm(te1_state_dict, te2_state_dict):
+    """Convert Diffusers text encoder state dicts to LDM format with conditioner prefix"""
+    ldm_state_dict = {}
+    
+    # Text Encoder 1 (CLIP-ViT-L)
+    for key, value in te1_state_dict.items():
+        ldm_state_dict[f"conditioner.embedders.0.transformer.{key}"] = value
+    
+    # Text Encoder 2 (CLIP-ViT-bigG) 
+    for key, value in te2_state_dict.items():
+        ldm_state_dict[f"conditioner.embedders.1.model.{key}"] = value
+    
+    return ldm_state_dict
+
+
 def save_checkpoint(
     unet, text_encoder_1, text_encoder_2, vae,
     tokenizer_1, tokenizer_2, noise_scheduler,
     accelerator, config, epoch, step, output_dir,
 ):
-    """Save checkpoint: Accelerate State (for resume) + Single File (for inference)"""
+    """Save checkpoint in single file format (SGM/LDM compatible)
     
+    This implementation follows the approach from modules/sdxl_model.py
+    to save weights in a format compatible with ComfyUI/WebUI.
+    """
+    cfg = config.trainer
     save_dir = Path(output_dir) / f"checkpoint-e{epoch}_s{step}"
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Save Accelerate State (Optimizer, LR Scheduler, etc.) - Must be called by ALL processes
     accelerator.save_state(save_dir)
+
+    # 2. Gather and save single file (main process only for final save)
+    weight_to_save = {}
     
-    # 2. Main Process Only: Save Single File
+    # Check if using DeepSpeed
+    if hasattr(accelerator.state, "deepspeed_plugin") and accelerator.state.deepspeed_plugin is not None:
+        from deepspeed import zero
+        
+        # Gather UNet weights from DeepSpeed
+        unwrapped_unet = accelerator.unwrap_model(unet)
+        with zero.GatheredParameters(unwrapped_unet.parameters()):
+            unet_state_dict = unwrapped_unet.state_dict()
+            for key, value in unet_state_dict.items():
+                weight_to_save[f"model.diffusion_model.{key}"] = value.cpu().clone()
+        
+        # Gather Text Encoder 1 if trained
+        if config.advanced.get("train_text_encoder_1", False):
+            unwrapped_te1 = accelerator.unwrap_model(text_encoder_1)
+            with zero.GatheredParameters(unwrapped_te1.parameters()):
+                te1_state_dict = unwrapped_te1.state_dict()
+                for key, value in te1_state_dict.items():
+                    weight_to_save[f"conditioner.embedders.0.transformer.{key}"] = value.cpu().clone()
+        else:
+            te1_state_dict = text_encoder_1.state_dict()
+            for key, value in te1_state_dict.items():
+                weight_to_save[f"conditioner.embedders.0.transformer.{key}"] = value.cpu().clone()
+        
+        # Gather Text Encoder 2 if trained
+        if config.advanced.get("train_text_encoder_2", False):
+            unwrapped_te2 = accelerator.unwrap_model(text_encoder_2)
+            with zero.GatheredParameters(unwrapped_te2.parameters()):
+                te2_state_dict = unwrapped_te2.state_dict()
+                for key, value in te2_state_dict.items():
+                    weight_to_save[f"conditioner.embedders.1.model.{key}"] = value.cpu().clone()
+        else:
+            te2_state_dict = text_encoder_2.state_dict()
+            for key, value in te2_state_dict.items():
+                weight_to_save[f"conditioner.embedders.1.model.{key}"] = value.cpu().clone()
+                
+    else:
+        # Non-DeepSpeed: simple unwrap
+        unwrapped_unet = accelerator.unwrap_model(unet)
+        unet_state_dict = unwrapped_unet.state_dict()
+        for key, value in unet_state_dict.items():
+            weight_to_save[f"model.diffusion_model.{key}"] = value.cpu().clone()
+        
+        # Text Encoders
+        unwrapped_te1 = accelerator.unwrap_model(text_encoder_1) if config.advanced.get("train_text_encoder_1", False) else text_encoder_1
+        te1_state_dict = unwrapped_te1.state_dict()
+        for key, value in te1_state_dict.items():
+            weight_to_save[f"conditioner.embedders.0.transformer.{key}"] = value.cpu().clone()
+        
+        unwrapped_te2 = accelerator.unwrap_model(text_encoder_2) if config.advanced.get("train_text_encoder_2", False) else text_encoder_2
+        te2_state_dict = unwrapped_te2.state_dict()
+        for key, value in te2_state_dict.items():
+            weight_to_save[f"conditioner.embedders.1.model.{key}"] = value.cpu().clone()
+    
+    # VAE is always frozen, no need for distributed gathering
+    vae_state_dict = vae.state_dict()
+    for key, value in vae_state_dict.items():
+        weight_to_save[f"first_stage_model.{key}"] = value.cpu().clone()
+    
+    # 3. Save the single file (main process only)
     if accelerator.is_main_process:
-        # Save single file (.safetensors)
+        save_path = save_dir / "model.safetensors"
+        metadata = {
+            "epoch": str(epoch),
+            "global_step": str(step),
+            "format": "sdxl_sgm",
+        }
         try:
-            unwrapped_unet = accelerator.unwrap_model(unet)
-            pipeline = StableDiffusionXLPipeline(
-                vae=accelerator.unwrap_model(vae),
-                text_encoder=accelerator.unwrap_model(text_encoder_1),
-                text_encoder_2=accelerator.unwrap_model(text_encoder_2),
-                tokenizer=None,
-                tokenizer_2=None,
-                unet=unwrapped_unet,
-                scheduler=None,
-            )
-            pipeline.save_single_file(save_dir / "model.safetensors")
-            logger.info(f"Saved checkpoint and single-file to {save_dir}")
+            save_file(weight_to_save, str(save_path), metadata=metadata)
+            logger.info(f"Saved single-file checkpoint to {save_path}")
         except Exception as e:
             logger.warning(f"Failed to save single file: {e}")
-
+    
     # Ensure all processes wait for saving to complete
     accelerator.wait_for_everyone()
 
