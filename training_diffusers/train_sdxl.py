@@ -727,6 +727,9 @@ def main():
         transformers_logging.set_verbosity_error()
         diffusers_logging.set_verbosity_error()
 
+    # Suppress httpx logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     # Logging
     AcceleratorState().deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.trainer.batch_size
     if accelerator.is_main_process:
