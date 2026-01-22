@@ -707,6 +707,26 @@ def main():
         log_with="wandb" if cfg.get("wandb_id") else None,
         project_config=project_config,
     )
+
+    # Configure logging
+    import logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        from transformers.utils import logging as transformers_logging
+        from diffusers.utils import logging as diffusers_logging
+        transformers_logging.set_verbosity_warning()
+        diffusers_logging.set_verbosity_info()
+    else:
+        from transformers.utils import logging as transformers_logging
+        from diffusers.utils import logging as diffusers_logging
+        transformers_logging.set_verbosity_error()
+        diffusers_logging.set_verbosity_error()
+
     # Logging
     AcceleratorState().deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.trainer.batch_size
     if accelerator.is_main_process:
