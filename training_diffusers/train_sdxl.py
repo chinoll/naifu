@@ -398,7 +398,7 @@ def generate_samples(
 
     # Get num_images and negative_prompt from config
     num_images = sampling_cfg.get("num_images", 1)
-    negative_prompt = sampling_cfg.get("negative_prompt", "lowres, low quality, text, error, extra digit, cropped")
+    negative_prompt = sampling_cfg.get("negative_prompt", "")
     total_images = len(prompts) * num_images
     logger.info(f"Generating {total_images} sample(s) ({len(prompts)} prompts x {num_images} images each)...")
     logger.info(f"Negative prompt: {negative_prompt[:50]}..." if len(negative_prompt) > 50 else f"Negative prompt: {negative_prompt}")
@@ -855,6 +855,18 @@ def main():
             accelerator.load_state(str(dirs[-1]))
             logger.info(f"Resumed from {dirs[-1]}")
     
+    # Initial sampling check
+    if accelerator.is_main_process and config.sampling.enabled:
+        logger.info("Performing initial sampling check...")
+        sampling_prompts = config.sampling.get("prompts", [])
+        if sampling_prompts:
+            save_sample_dir = Path(cfg.sample_dir)
+            generate_samples(
+                unet, vae, te1, te2, tok1, tok2, scheduler,
+                sampling_prompts, config, accelerator, 0, 0,
+                save_sample_dir / "initial_check"
+            )
+
     # Training loop
     logger.info("***** Starting training *****")
     logger.info(f"  Num examples = {len(dataset)}")
