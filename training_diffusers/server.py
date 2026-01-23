@@ -168,9 +168,9 @@ class ServerDataset:
                 if not self.debug and key in self.metadata:
                     meta = self.metadata[key]
                     meta_dict = meta.get('metadata', meta) if isinstance(meta.get('metadata'), dict) else meta
-                    #for field_key, value in meta_dict.items():
-                    #    if field_key.endswith('_repeat') and isinstance(value, (int, float)):
-                    #        repeat_count = max(repeat_count, int(value))
+                    for field_key, value in meta_dict.items():
+                        if field_key.endswith('_repeat') and isinstance(value, (int, float)):
+                            repeat_count = max(repeat_count, int(value))
                 
                 # Only add if we have metadata or if debugging
                 if self.debug or key in self.metadata:
