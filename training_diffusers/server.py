@@ -14,7 +14,6 @@ import sys
 import orjson
 import random
 import os
-import json
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -133,11 +132,18 @@ class ServerDataset:
              raise FileNotFoundError(f"Latents dir not found: {latents_dir}")
 
         from tqdm import tqdm
-        self.buckets = {
-            k: self._dirwalk(os.path.join(latents_dir, k)) 
-            for k in tqdm(os.listdir(latents_dir))
-            if os.path.isdir(os.path.join(latents_dir, k))
-        }
+        self.buckets = {}
+        for k in tqdm(os.listdir(latents_dir)):
+            dir_path = os.path.join(latents_dir, k)
+            if os.path.isdir(dir_path):
+                # Extract prefix (format: prefix_postfix). 
+                # This handles cases like xx_yy_zz -> prefix xx_yy (merging zz variants)
+                prefix = k.rsplit("_", 1)[0] if "_" in k else k
+                
+                if prefix not in self.buckets:
+                    self.buckets[prefix] = []
+                
+                self.buckets[prefix].extend(self._dirwalk_npy(dir_path))
         
         # 2. Load metadata
         self.metadata = {}
@@ -148,7 +154,7 @@ class ServerDataset:
                     for line in tqdm(f):
                         line = line.strip()
                         if line:
-                            record = json.loads(line)
+                            record = orjson.loads(line)
                             self.metadata.update(record)
                 logger.info(f"Loaded metadata from: {jsonl_path}")
             else:
@@ -208,7 +214,7 @@ class ServerDataset:
         self.dropout_config.update(new_config)
         logger.info("Updated tag dropout configuration")
 
-    def _dirwalk(self, path):
+    def _dirwalk_npy(self, path):
         path = Path(path)
         return [str(file) for file in path.rglob('*.npy') if file.is_file()]
 
