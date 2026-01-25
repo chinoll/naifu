@@ -373,6 +373,7 @@ async def get_batch(request):
         return json_response({"error": "Dataset not loaded"}, 503)
     
     indices = []
+    body_data = {}
     try:
         body_data = orjson.loads(request.body)
         indices = body_data.get("indices", [])
