@@ -20,7 +20,6 @@ from typing import List, Dict, Any
 from robyn import Robyn, Request, Response
 
 # Setup logging
-# Setup logging
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -379,6 +378,7 @@ async def get_batch(request):
              raise ValueError("get_batch_metadata returned empty data for non-empty indices")
         return json_response(data)
     except Exception as e:
+        print(e,body_data)
         logger.error(f"Error fetching batch: {e}", exc_info=True)
         try:
             # Fallback: pick a random sample and repeat it
@@ -653,7 +653,7 @@ def main():
             print("Non-interactive environment detected, assuming safe to proceed.")
     
     logger.info(f"Starting Robyn server on {args.host}:{args.port}")
-    app.start(host=args.host, port=args.port)
+    app.start(host=args.host, port=args.port,log_level="INFO")
 
 
 if __name__ == "__main__":
