@@ -370,15 +370,25 @@ async def get_batch(request):
     if dataset is None:
         return json_response({"error": "Dataset not loaded"}, 503)
     
+    indices = []
     try:
         body_data = orjson.loads(request.body)
         indices = body_data.get("indices", [])
         data = dataset.get_batch_metadata(indices)
+        if indices and not data:
+             raise ValueError("get_batch_metadata returned empty data for non-empty indices")
         return json_response(data)
     except Exception as e:
         logger.error(f"Error fetching batch: {e}", exc_info=True)
+        try:
+            # Fallback: pick a random sample and repeat it
+            n = len(indices) if indices else 1
+            indices = [random.randint(0, len(dataset.files) - 1)] * n
+            data = dataset.get_batch_metadata(indices)
+            return json_response(data)
+        except Exception as fallback_e:
+            logger.error(f"Fallback also failed: {fallback_e}")
         return json_response({"error": str(e)}, 500)
-
 
 @app.post("/dataset/reload")
 async def reload_dataset(request):
@@ -495,6 +505,7 @@ async def dataset_next_batch(request):
     if dataset is None:
          return json_response({"error": "Dataset not loaded"}, 503)
     
+    indices = []
     try:
         epoch = int(request.query_params.get("epoch", 0))
         batch_idx = int(request.query_params.get("batch_idx", 0))
@@ -513,9 +524,24 @@ async def dataset_next_batch(request):
             return json_response([])
         
         data = dataset.get_batch_metadata(indices)
+        if indices and not data:
+             raise ValueError("get_batch_metadata returned empty data for non-empty indices")
         return json_response(data)
     except Exception as e:
         logger.error(f"Error in dataset_next_batch: {e}", exc_info=True)
+        
+        # Fallback: pick a random sample and repeat it
+        try:
+            n = len(indices) if indices else 4 # default to 4 if indices not yet determined
+            for _ in range(10):
+                rand_idx = random.randint(0, len(dataset.files) - 1)
+                sample = dataset.get_batch_metadata([rand_idx])
+                if sample:
+                    logger.warning(f"Returning fallback batch (repeated {n} times) due to error")
+                    return json_response(sample * n)
+        except Exception as fallback_e:
+            logger.error(f"Fallback also failed: {fallback_e}")
+            
         return json_response({"error": str(e)}, 500)
 
 
