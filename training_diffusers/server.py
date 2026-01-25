@@ -23,7 +23,10 @@ from robyn import Robyn, Request, Response
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("server.log", mode='a', encoding='utf-8')
+    ],
     force=True
 )
 logger = logging.getLogger(__name__)
@@ -363,7 +366,7 @@ async def get_dataset_info(request):
         "bucket_indices": dataset.bucket_indices
     })
 
-
+import traceback
 @app.post("/dataset/batch")
 async def get_batch(request):
     if dataset is None:
@@ -378,8 +381,8 @@ async def get_batch(request):
              raise ValueError("get_batch_metadata returned empty data for non-empty indices")
         return json_response(data)
     except Exception as e:
-        print(e,body_data)
-        logger.error(f"Error fetching batch: {e}", exc_info=True)
+        traceback_str = traceback.format_exc()
+        logger.error(f"Error fetching batch: {e}, {body_data}, {traceback_str}", exc_info=True)
         try:
             # Fallback: pick a random sample and repeat it
             n = len(indices) if indices else 1
