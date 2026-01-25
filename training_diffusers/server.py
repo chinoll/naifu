@@ -656,7 +656,7 @@ def main():
             print("Non-interactive environment detected, assuming safe to proceed.")
     
     logger.info(f"Starting Robyn server on {args.host}:{args.port}")
-    app.start(host=args.host, port=args.port,log_level="INFO")
+    app.start(host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
