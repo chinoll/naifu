@@ -267,6 +267,25 @@ class ServerDataset:
             })
         return results
 
+    @staticmethod
+    def check_and_convert_to_list(val):
+        """
+        Check and convert value to list. Handles both string and list formats.
+        Always returns a list (empty list if input is None/empty).
+        
+        Args:
+            val: Input value (list, string, or other)
+        Returns:
+            list: Converted list
+        """
+        if isinstance(val, list):
+            return val
+        elif isinstance(val, str) and val:
+            if ',' in val:
+                return [v.strip() for v in val.split(',') if v.strip()]
+            return [val]
+        return []
+    
     def apply_tag_dropout(self, meta: dict) -> str:
         """Apply tag dropout to generate final prompt"""
         cfg_root = self.dropout_config
@@ -280,12 +299,12 @@ class ServerDataset:
                 cfg = cfg_root.get("e621", self.DEFAULT_TAG_DROPOUT_CONFIG["e621"])
                 
                 for key, drop_key in [("copyright", "copyright_drop"), ("character", "character_drop")]:
-                    val = t.get(key, [])
-                    if val and random.random() >= cfg.get(drop_key, 0):
-                        final_components.append(", ".join(val))
+                    val_list = self.check_and_convert_to_list(t.get(key, []))
+                    if val_list and random.random() >= cfg.get(drop_key, 0):
+                        final_components.append(", ".join(val_list))
                 
                 for key, drop_key in [("species", "species_drop"), ("general", "general_drop")]:
-                    val_list = t.get(key, [])
+                    val_list = self.check_and_convert_to_list(t.get(key, []))
                     if val_list:
                         kept = [v for v in val_list if random.random() >= cfg.get(drop_key, 0)]
                         if kept:
@@ -300,7 +319,7 @@ class ServerDataset:
                 cfg = cfg_root.get("danbooru", self.DEFAULT_TAG_DROPOUT_CONFIG["danbooru"])
                 
                 # Characters
-                chars = t.get("character", [])
+                chars = self.check_and_convert_to_list(t.get("character", []))
                 char_count = t.get("character_image_count", 0)
                 for c in chars:
                     prob = round(1.0 - (500.0 / char_count), 2) if char_count > 500 else cfg.get("character_drop", 0)
@@ -309,7 +328,7 @@ class ServerDataset:
                         final_components.append(c)
                 
                 # Artists
-                artists = t.get("artist", [])
+                artists = self.check_and_convert_to_list(t.get("artist", []))
                 artist_count = t.get("artist_count", 0)
                 for a in artists:
                     prob = round(1.0 - (500.0 / artist_count), 2) if artist_count > 500 else cfg.get("character_drop", 0)
@@ -318,14 +337,14 @@ class ServerDataset:
                         final_components.append(a)
                 
                 # Copyright
-                copy_val = t.get("copyright", [])
+                copy_val = self.check_and_convert_to_list(t.get("copyright", []))
                 if copy_val and random.random() >= cfg.get("character_drop", 0):
                     final_components.extend(copy_val)
                 
                 # General
-                gen_list = t.get("general", [])
+                gen_list = self.check_and_convert_to_list(t.get("general", []))
                 if gen_list:
-                    core_tags = set(t.get("character_core_tags", []))
+                    core_tags = set(self.check_and_convert_to_list(t.get("character_core_tags", [])))
                     in_core = [tag for tag in gen_list if tag in core_tags]
                     not_in_core = [tag for tag in gen_list if tag not in core_tags]
                     
